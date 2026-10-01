@@ -216,3 +216,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# fetch_pdfs.py data - never commit: only scripts and docs belong in git
+*.pdf
+*.pdf.part
+pdfs/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+*.db-*
+*.csv
+*.csv.part
+logs/
+*.log
+.env
