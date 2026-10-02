@@ -91,6 +91,8 @@ Run: 01:31–04:54 (3 h 24 min), average 311 DOIs/min, sources Unpaywall and Ope
 
 Output: 7,005 PDFs, 17.1 GB (median 1.5 MB, largest 48 MB), named `<RW ID> - <title>.pdf`, plus `index.csv`. Files on disk and the database agree, and there are no half-finished downloads. 6,957 PDFs were found via Unpaywall and 48 via OpenAlex.
 
+The PDFs and `index.csv` are in the shared Nextcloud folder (`Retracted_Papers`) and are uploaded by the Nextcloud desktop client. The database, logs and reports stay on the local PC, outside the synced folder. 241 files have a full local path longer than 260 characters; Windows handles them because long-path support is enabled, but Windows Explorer may have trouble opening those files. The plan is to cut the title part of file names to 150 characters.
+
 **Main reasons for the 56,785 missing PDFs:**
 
 | Reason | Papers | What can be done |
@@ -166,7 +168,7 @@ Things that were deliberately **not** done: no browser automation (e.g. Puppetee
 | Phase | Source | Result / expected | Needs |
 |---|---|---|---|
 | A | Unpaywall + OpenAlex (open access) | **done: 7,005 PDFs (11%)** | – |
-| A (retry) | same, `--retry-failed` in a few days | up to ~800 (timeouts, other errors) | nothing |
+| A (retry) | same, `--retry-failed` in a few days | up to ~840 (timeouts, network errors, HTTP 5xx) | nothing |
 | B | Wiley TDM (incl. Hindawi, if Wiley serves 10.1155) | up to ~15,400 | Wiley TDM token |
 | B | Elsevier API | up to ~8,000 | Elsevier API key + institutional token |
 | C | Crossref full-text links | depends on licences | library approval, university network |
@@ -180,4 +182,6 @@ With the Wiley and Elsevier tokens, roughly half of the list looks reachable.
 
 1. Send `reports/missing_by_publisher.csv` and `reports/publisher_summary.csv` to the university library with the TDM request (Elsevier, Wiley/Hindawi, Springer Nature, IEEE).
 2. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
-3. Upload the PDFs to cloud.ovgu.de (Nextcloud desktop client recommended).
+3. Check that the Nextcloud upload is complete (7,006 files: 7,005 PDFs + `index.csv`).
+4. Shorten file names to at most 150 characters for the title part (existing and future PDFs).
+5. Retry the ~840 papers with temporary errors (timeouts, network errors, HTTP 5xx) with `--retry-failed` in a few days.

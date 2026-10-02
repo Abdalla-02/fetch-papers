@@ -487,6 +487,9 @@ def cmd_run(args):
     if "@" not in args.email:
         sys.exit("--email is required (Unpaywall/OpenAlex/Crossref ask for it)")
     con = open_db(args.db)
+    if not con.execute("SELECT COUNT(*) FROM papers").fetchone()[0]:
+        # a wrong --db path would otherwise create an empty DB and overwrite index.csv with nothing
+        sys.exit(f"{os.path.abspath(args.db)} contains no papers - run 'import' first or check --db")
     try:
         asyncio.run(Fetcher(args, con).run())
     except KeyboardInterrupt:
@@ -521,7 +524,10 @@ def write_index(con, out: Path):
 
 
 def cmd_index(args):
-    write_index(open_db(args.db), Path(args.out))
+    con = open_db(args.db)
+    if not con.execute("SELECT COUNT(*) FROM papers").fetchone()[0]:
+        sys.exit(f"{os.path.abspath(args.db)} contains no papers - check --db (index.csv not touched)")
+    write_index(con, Path(args.out))
 
 
 # ----------------------------------------------------------------------------- summary for the library
