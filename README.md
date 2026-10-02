@@ -60,7 +60,13 @@ Ask your library for TDM access. Here is a short email you can adapt:
 
 > For a research project on retracted literature I need the full texts of ~64,000 retracted articles (list attached, DOIs). I'd like to obtain them via the publishers' TDM APIs (Elsevier, Wiley, Springer Nature, IEEE) under §60d UrhG rather than by manual downloading. Can you provide an Elsevier institutional token / confirm our TDM entitlements, and advise for IEEE and Springer Nature?
 
-Attach the CSV from `report --export`, filtered to the papers that are still missing. The table shows which DOIs belong to which publisher and how many are still missing, measured before Phase A:
+Attach the files made by
+
+```bash
+python fetch_pdfs.py summary --out-dir reports --email you@uni.de
+```
+
+`reports/missing_by_publisher.csv` lists every missing DOI grouped by publisher (names looked up at Crossref) with the main reason it is missing. `reports/publisher_summary.csv` gives one row per publisher with counts per reason and the suggested legal route. The table shows which DOIs belong to which publisher and how many are still missing, measured before Phase A:
 
 | DOI prefix | Publisher | Missing before Phase A | Route |
 |---|---|---|---|

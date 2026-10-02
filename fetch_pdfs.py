@@ -524,6 +524,120 @@ def cmd_index(args):
     write_index(open_db(args.db), Path(args.out))
 
 
+# ----------------------------------------------------------------------------- summary for the library
+# How the still-missing papers of the big publishers can be obtained legally.
+ROUTES = {
+    "10.1155": "Wiley TDM API (Hindawi is part of Wiley) - open access, download site blocks bots",
+    "10.1002": "Wiley TDM API (token)", "10.1111": "Wiley TDM API (token)",
+    "10.1016": "Elsevier Article Retrieval API (API key + institutional token)",
+    "10.1109": "IEEE - no public TDM PDF API; library arrangement",
+    "10.1007": "Springer Nature TDM - library", "10.1186": "Springer Nature TDM - library",
+    "10.1038": "Springer Nature TDM - library",
+}
+REASONS = ["closed access (no open-access copy)", "blocked by bot protection (Cloudflare)",
+           "refused by site (HTTP 401/403/429)", "HTML page instead of PDF",
+           "network error / timeout (worth retrying)", "TLS certificate error on site",
+           "broken link (HTTP 404/410)", "index lookup error (worth retrying)", "other"]
+
+
+def classify(status: str, error: str | None) -> str:
+    """One main reason per missing paper (most informative first)."""
+    if status == "not_found":
+        return REASONS[0]
+    e = error or ""
+    if "Cloudflare" in e:
+        return REASONS[1]
+    if re.search(r"HTTP (401|403|429)", e):
+        return REASONS[2]
+    if "HTML page instead of PDF" in e or "not a PDF" in e:
+        return REASONS[3]
+    if re.search(r"Timeout|ReadError|getaddrinfo|All connection attempts|RemoteProtocolError|ConnectError: +<", e):
+        return REASONS[4]
+    if "CERTIFICATE" in e or "SSL" in e or "TLS" in e:
+        return REASONS[5]
+    if re.search(r"HTTP (404|410)", e):
+        return REASONS[6]
+    if "lookup failed" in e:
+        return REASONS[7]
+    return REASONS[8]
+
+
+def publisher_names(con, prefixes, email):
+    """Publisher name per DOI prefix from Crossref (/prefixes/<p>), cached in the DB."""
+    con.execute("CREATE TABLE IF NOT EXISTS publishers (prefix TEXT PRIMARY KEY, name TEXT)")
+    names = dict(con.execute("SELECT prefix, name FROM publishers"))
+    todo = [p for p in prefixes if p not in names]
+    if todo:
+        print(f"looking up {len(todo)} publisher names at Crossref ...")
+    with httpx.Client(timeout=TIMEOUT, headers={"User-Agent": f"RetractedPapersResearch/1.0 (mailto:{email})"}) as c:
+        for i, p in enumerate(todo):
+            time.sleep(1.0 / HOST_RPS["api.crossref.org"])
+            try:
+                r = c.get(f"{CROSSREF}/prefixes/{p}", params={"mailto": email})
+                name = r.json()["message"]["name"] if r.status_code == 200 else ""
+            except Exception:
+                continue  # not cached -> tried again next time
+            names[p] = name
+            con.execute("INSERT OR REPLACE INTO publishers VALUES (?,?)", (p, name))
+            if i % 50 == 49:
+                con.commit()
+    con.commit()
+    return names
+
+
+def cmd_summary(args):
+    con = open_db(args.db)
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    rows = con.execute("SELECT doi, record_ids, title, status, error FROM papers").fetchall()
+    per = defaultdict(lambda: defaultdict(int))
+    missing = []
+    for doi, ids, title, status, err in rows:
+        p = doi.split("/")[0]
+        per[p]["total"] += 1
+        if status == "done":
+            per[p]["done"] += 1
+            continue
+        reason = classify(status, err) if status != "pending" else "not processed yet"
+        per[p][reason] += 1
+        missing.append((p, doi, first_id(ids), ids, title, status, reason))
+    names = {} if args.no_names else publisher_names(con, sorted(per), args.email)
+    order = sorted(per, key=lambda p: -(per[p]["total"] - per[p]["done"]))
+    rank = {p: i for i, p in enumerate(order)}
+
+    with open(out / "publisher_summary.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["doi_prefix", "publisher", "papers", "downloaded", "missing", "missing_%",
+                    "suggested_route"] + REASONS)
+        for p in order:
+            d = per[p]
+            miss = d["total"] - d["done"]
+            w.writerow([p, names.get(p, ""), d["total"], d["done"], miss, f"{100 * miss / d['total']:.0f}",
+                        ROUTES.get(p, "")] + [d[r] for r in REASONS])
+
+    missing.sort(key=lambda m: (rank[m[0]], m[1]))
+    with open(out / "missing_by_publisher.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["publisher", "doi_prefix", "doi", "rw_id", "all_rw_ids", "title", "status", "reason"])
+        for p, doi, rid, ids, title, status, reason in missing:
+            w.writerow([names.get(p, ""), p, doi, rid, ids, title, status, reason])
+
+    # console summary
+    total, done = len(rows), sum(per[p]["done"] for p in per)
+    print(f"\npapers with DOI: {total}   downloaded: {done} ({100 * done / total:.1f}%)   missing: {total - done}")
+    print("\nmain reasons for missing PDFs:")
+    reasons = defaultdict(int)
+    for m in missing:
+        reasons[m[6]] += 1
+    for r, n in sorted(reasons.items(), key=lambda x: -x[1]):
+        print(f"  {n:6}  {r}")
+    print(f"\nmissing by publisher (top {args.top}):")
+    for p in order[:args.top]:
+        d = per[p]
+        print(f"  {p:<9} {names.get(p, '')[:38]:<38} {d['total'] - d['done']:6} of {d['total']:6} missing")
+    print(f"\nwritten: {out / 'publisher_summary.csv'}\n         {out / 'missing_by_publisher.csv'} ({len(missing)} rows)")
+
+
 def cmd_rename(args):
     """Switch every paper to the current naming scheme ('<RW ID> - <title>') and rename
     PDFs already downloaded. Never deletes anything; --dry-run only prints the plan."""
@@ -615,6 +729,13 @@ def main():
     x = sub.add_parser("index", help="write index.csv (all papers, sorted by RW ID) into the PDF folder")
     x.add_argument("--out", required=True, help="the PDF folder")
     x.set_defaults(func=cmd_index)
+
+    m = sub.add_parser("summary", help="per-publisher summary + CSV of missing DOIs (for the library)")
+    m.add_argument("--out-dir", default="reports", help="folder for the CSV files (default: reports)")
+    m.add_argument("--email", default="", help="contact e-mail for the Crossref publisher-name lookup")
+    m.add_argument("--no-names", action="store_true", help="skip looking up publisher names at Crossref")
+    m.add_argument("--top", type=int, default=20)
+    m.set_defaults(func=cmd_summary)
 
     n = sub.add_parser("rename", help="rename existing PDFs to '<RW ID> - <title>.pdf' (never deletes)")
     n.add_argument("--out", required=True, help="the PDF folder")
