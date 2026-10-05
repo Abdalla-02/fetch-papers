@@ -1,6 +1,6 @@
 # Retracted-papers PDF downloader
 
-`fetch_pdfs.py` downloads the PDFs for the DOIs in the Retraction Watch CSV and saves each one as `<RW ID> - <title>.pdf`. It uses only legal channels: open-access indexes and the publishers' official text-and-data-mining (TDM) APIs. It never logs in to your university account and never tries to get past bot protection.
+`fetch_pdfs.py` downloads the PDFs for the DOIs in the Retraction Watch CSV and saves each one as `<ID block>/<RW ID> - <title>.pdf`, e.g. `001001-002000/001454 - Circulatory Responses ….pdf`. It uses only legal channels: open-access indexes and the publishers' official text-and-data-mining (TDM) APIs. It never logs in to your university account and never tries to get past bot protection.
 
 **About the CSV:** `retraction_watch_1.10.26 - short-version.csv` (columns `ID`, `Title`, `OriginalPaperDOI`) has 72,790 rows, which become 63,790 unique DOIs after cleaning. 5,950 rows have no usable DOI; they're kept in the database (table `no_doi`) so you can handle them by hand.
 
@@ -129,7 +129,7 @@ Still missing after Phase A (largest publishers):
 Two things to know:
 
 - Deleting a PDF in the synced folder also deletes it in the cloud.
-- Some full paths are longer than 260 characters. This works when Windows long-path support is enabled, but Windows Explorer can have trouble opening those files.
+- PDFs are grouped in subfolders of 1,000 Retraction Watch IDs, so no folder gets too large to open quickly, and titles are cut to 150 characters so full paths stay under Windows' 260-character limit. Moving files into the subfolders with `rename` is synced as a move, not a new upload.
 
 Zipping the PDFs first is not worth it: they are already compressed, so a zip saves only about 13%, and single papers could no longer be opened in the cloud.
 
@@ -142,8 +142,8 @@ rclone copy /data/retracted_pdfs cloud:RetractedPapers --progress   # repeat aft
 
 ## 5. How it works
 
-- **File names:** `<RW ID> - <title>.pdf`, e.g. `001454 - Circulatory Responses to Laryngeal Mask Airway Insertion ….pdf`. The Retraction Watch ID is zero-padded to 6 digits so the folder sorts by ID, and it makes every name unique. If several Retraction Watch entries share one DOI, the smallest ID is used (all IDs are listed in `index.csv`). The title has characters like `/ : ? *` removed and is cut to a maximum of 200 bytes.
-- **`index.csv`:** written into the PDF folder after every `run` (or with `index`). One row per Retraction Watch entry, sorted by ID: `rw_id, all_rw_ids, doi, doi_prefix, title, filename, status, source, pdf_url, error`. It includes the papers that are still missing and the rows without a DOI (`status = no_doi`), so you can filter it in Excel. It is saved as UTF-8 with BOM so Excel shows special characters correctly.
+- **Folders and file names:** `<ID block>/<RW ID> - <title>.pdf`, e.g. `001001-002000/001454 - Circulatory Responses to Laryngeal Mask Airway Insertion ….pdf`. Each subfolder holds one block of 1,000 Retraction Watch IDs (`FOLDER_SIZE`), so a folder never holds more than 1,000 PDFs and you can find a paper from its ID alone. The ID is zero-padded to 6 digits so everything sorts by ID, and it makes every name unique. If several Retraction Watch entries share one DOI, the smallest ID is used (all IDs are listed in `index.csv`). The title has characters like `/ : ? *` removed and is cut to 150 characters (`MAX_TITLE_CHARS`), at a word boundary where possible; the full title is in `index.csv`.
+- **`index.csv`:** written into the PDF folder after every `run` (or with `index`). One row per Retraction Watch entry, sorted by ID: `rw_id, all_rw_ids, doi, doi_prefix, title, folder, filename, status, source, pdf_url, error`. `folder` and `filename` are filled for downloaded papers. It includes the papers that are still missing and the rows without a DOI (`status = no_doi`), so you can filter it in Excel. It is saved as UTF-8 with BOM so Excel shows special characters correctly.
 - **Renaming after a naming change:** `rename --out <folder> --dry-run` shows what would change; without `--dry-run` it renames the PDFs and updates the database. It never deletes anything, and if a rename fails it undoes the renames it already made.
 - **No fake PDFs:** a file is saved only if its first kilobyte contains `%PDF`. HTML login and bot-check pages are rejected and logged as `not a PDF`.
 - **Polite rate limits:** each server gets its own speed limit (`HOST_RPS` and `DEFAULT_RPS` at the top of the script). Publisher sites get one request every 2 seconds; the Wiley TDM API one every 10 seconds (its limit is 60 per 10 minutes). Redirects are followed one hop at a time, so the limit applies to the server that actually answers, and API keys are never forwarded to another host. When a site answers 429 or 403, the script slows down for that site and speeds up again once requests succeed; a line starting with `! host … keeps pushing back` appears in the log.
