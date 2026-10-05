@@ -19,7 +19,8 @@ Usage:
   python fetch_pdfs.py index   --out /data/retracted_pdfs        (writes index.csv)
   python fetch_pdfs.py rename  --out /data/retracted_pdfs [--dry-run]
 
-PDFs are named '<RW ID> - <title>.pdf', e.g. '001454 - Circulatory Responses ....pdf'.
+PDFs are saved as '<ID block>/<RW ID> - <title>.pdf' (title cut to 150 characters),
+e.g. '001001-002000/001454 - Circulatory Responses ....pdf'.
 
 Requires: Python 3.9+, `pip install httpx`
 """
@@ -69,7 +70,9 @@ BLOCK_AFTER = 8
 
 MAX_PDF_BYTES = 300 * 1024 * 1024
 TIMEOUT = httpx.Timeout(60.0, connect=20.0)
-MAX_FILENAME_BYTES = 200  # ext4/NTFS limit is 255; leave room for suffix + ".pdf"
+MAX_TITLE_CHARS = 150     # title part of a file name; keeps full Windows paths under 260 characters
+MAX_FILENAME_BYTES = 200  # extra cap for non-Latin titles (ext4 allows 255 bytes per name)
+FOLDER_SIZE = 1000        # PDFs are grouped in subfolders of 1,000 Retraction Watch IDs each
 
 # ----------------------------------------------------------------------------- helpers
 DOI_RE = re.compile(r"10\.\d{4,9}/\S+", re.I)
@@ -92,6 +95,12 @@ def safe_filename(title: str) -> str:
     t = re.sub(r"\s+", " ", t).strip(" .")
     if not t:
         t = "untitled"
+    if len(t) > MAX_TITLE_CHARS:
+        cut = t[:MAX_TITLE_CHARS]
+        space = cut.rfind(" ")
+        if space >= MAX_TITLE_CHARS - 30:  # end at a word boundary if one is close
+            cut = cut[:space]
+        t = cut.rstrip(" .,;-")
     b = t.encode("utf-8")
     if len(b) > MAX_FILENAME_BYTES:
         t = b[:MAX_FILENAME_BYTES].decode("utf-8", "ignore").rstrip(" .")
@@ -105,9 +114,19 @@ def first_id(record_ids: str) -> str:
     return f"{nums[0]:06d}" if nums else (ids[0] if ids else "000000")
 
 
+def subfolder(rw_id: str) -> str:
+    """Folder for a paper: blocks of FOLDER_SIZE IDs, e.g. ID 001454 -> '001001-002000'."""
+    if not rw_id.isdigit():
+        return "other"
+    lo = (int(rw_id) - 1) // FOLDER_SIZE * FOLDER_SIZE + 1
+    return f"{lo:06d}-{lo + FOLDER_SIZE - 1:06d}"
+
+
 def make_filename(record_ids: str, title: str) -> str:
-    """File name (without extension): '<RW ID> - <title>', e.g. '001454 - Circulatory Responses ...'."""
-    return f"{first_id(record_ids)} - {safe_filename(title)}"
+    """Path of the PDF relative to the output folder, without extension:
+    '<ID block>/<RW ID> - <title>', e.g. '001001-002000/001454 - Circulatory Responses ...'."""
+    rid = first_id(record_ids)
+    return f"{subfolder(rid)}/{rid} - {safe_filename(title)}"
 
 
 def looks_like_pdf(first_bytes: bytes) -> bool:
@@ -372,6 +391,7 @@ class Fetcher:
                     self.limiter.refused(final, err)
                 return err + via
             size, first = 0, b""
+            dest.parent.mkdir(parents=True, exist_ok=True)  # ID-block subfolder
             with open(tmp, "wb") as f:
                 async for chunk in r.aiter_bytes(65536):
                     if not first:
@@ -498,20 +518,23 @@ def cmd_run(args):
 
 
 # ----------------------------------------------------------------------------- index / rename
-INDEX_COLUMNS = ["rw_id", "all_rw_ids", "doi", "doi_prefix", "title", "filename",
+INDEX_COLUMNS = ["rw_id", "all_rw_ids", "doi", "doi_prefix", "title", "folder", "filename",
                  "status", "source", "pdf_url", "error"]
 
 
 def write_index(con, out: Path):
     """Write <out>/index.csv: one row per paper (incl. rows without DOI), sorted by RW ID.
+    'folder' and 'filename' are only filled for downloaded papers.
     UTF-8 with BOM so Excel shows non-ASCII titles correctly."""
     rows = []
     for doi, ids, title, fn, status, source, url, err in con.execute(
             "SELECT doi, record_ids, title, filename, status, source, pdf_url, error FROM papers"):
-        rows.append([first_id(ids), ids, doi, doi.split("/")[0], title,
-                     f"{fn}.pdf" if status == "done" else "", status, source, url, (err or "")[:300]])
+        folder, _, name = fn.rpartition("/")
+        done = status == "done"
+        rows.append([first_id(ids), ids, doi, doi.split("/")[0], title, folder if done else "",
+                     f"{name}.pdf" if done else "", status, source, url, (err or "")[:300]])
     for rid, title, raw in con.execute("SELECT record_id, title, raw_doi FROM no_doi"):
-        rows.append([first_id(rid), rid, raw, "", title, "", "no_doi", "", "", "no usable DOI in the CSV"])
+        rows.append([first_id(rid), rid, raw, "", title, "", "", "no_doi", "", "", "no usable DOI in the CSV"])
     rows.sort(key=lambda r: r[0])
     out.mkdir(parents=True, exist_ok=True)
     tmp = out / "index.csv.part"
@@ -645,8 +668,8 @@ def cmd_summary(args):
 
 
 def cmd_rename(args):
-    """Switch every paper to the current naming scheme ('<RW ID> - <title>') and rename
-    PDFs already downloaded. Never deletes anything; --dry-run only prints the plan."""
+    """Switch every paper to the current naming scheme ('<ID block>/<RW ID> - <title>') and
+    rename/move PDFs already downloaded. Never deletes anything; --dry-run only prints the plan."""
     con = open_db(args.db)
     out = Path(args.out)
     plan = [(doi, old, make_filename(ids, title), status)
@@ -669,12 +692,17 @@ def cmd_rename(args):
     done = []
     try:
         for _, old, new in files:
+            (out / f"{new}.pdf").parent.mkdir(parents=True, exist_ok=True)
             os.rename(out / f"{old}.pdf", out / f"{new}.pdf")
             done.append((old, new))
     except OSError as e:  # undo, so files and database stay consistent
         for old, new in reversed(done):
             os.rename(out / f"{new}.pdf", out / f"{old}.pdf")
         sys.exit(f"rename failed ({e}) - undone, nothing changed")
+    for _, old, _ in files:  # remove folders that the move left empty (never non-empty ones)
+        parent = (out / f"{old}.pdf").parent
+        if parent != out and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
     with con:  # one transaction; temporary names avoid UNIQUE clashes while swapping
         con.executemany("UPDATE papers SET filename='~tmp~'||doi WHERE doi=?", [(d,) for d, *_ in changes])
         con.executemany("UPDATE papers SET filename=? WHERE doi=?", [(new, d) for d, _, new, _ in changes])
@@ -743,7 +771,7 @@ def main():
     m.add_argument("--top", type=int, default=20)
     m.set_defaults(func=cmd_summary)
 
-    n = sub.add_parser("rename", help="rename existing PDFs to '<RW ID> - <title>.pdf' (never deletes)")
+    n = sub.add_parser("rename", help="rename/move existing PDFs to the current naming scheme (never deletes)")
     n.add_argument("--out", required=True, help="the PDF folder")
     n.add_argument("--dry-run", action="store_true", help="only show what would change")
     n.set_defaults(func=cmd_rename)

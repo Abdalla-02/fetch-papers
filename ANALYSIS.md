@@ -89,9 +89,9 @@ Run: 01:31–04:54 (3 h 24 min), average 311 DOIs/min, sources Unpaywall and Ope
 | Not found (no open-access copy) | 35,367 | 55.4% |
 | Failed (open-access link exists, download refused) | 21,418 | 33.6% |
 
-Output: 7,005 PDFs, 17.1 GB (median 1.5 MB, largest 48 MB), named `<RW ID> - <title>.pdf`, plus `index.csv`. Files on disk and the database agree, and there are no half-finished downloads. 6,957 PDFs were found via Unpaywall and 48 via OpenAlex.
+Output: 7,005 PDFs, 17.1 GB (median 1.5 MB, largest 48 MB), stored as `<ID block>/<RW ID> - <title>.pdf` in 74 subfolders of 1,000 IDs each, plus `index.csv`. Files on disk and the database agree, and there are no half-finished downloads. 6,957 PDFs were found via Unpaywall and 48 via OpenAlex.
 
-The PDFs and `index.csv` are in the shared Nextcloud folder (`Retracted_Papers`) and are uploaded by the Nextcloud desktop client. The database, logs and reports stay on the local PC, outside the synced folder. 241 files have a full local path longer than 260 characters; Windows handles them because long-path support is enabled, but Windows Explorer may have trouble opening those files. The plan is to cut the title part of file names to 150 characters.
+The PDFs and `index.csv` are in the shared Nextcloud folder (`Retracted_Papers`) and are uploaded by the Nextcloud desktop client. The database, logs and reports stay on the local PC, outside the synced folder. After Phase A the PDFs were moved into subfolders of 1,000 Retraction Watch IDs (currently 10–306 PDFs each, at most 1,000 when complete) so folders open quickly, and the title part of each name was cut to 150 characters. This brought the longest full path down to 243 characters, under the Windows limit of 260 (before, 241 files exceeded it).
 
 **Main reasons for the 56,785 missing PDFs:**
 
@@ -155,7 +155,7 @@ Wiley (incl. Hindawi) and Elsevier together account for **23,497 missing papers 
 | Hosts that refuse 8 downloads in a row are skipped for the rest of the run, with a warning in the log | Without this, the Hindawi refusals slowed the whole run from ~370 to ~50 papers/min. Skipping also sends fewer requests to hosts that do not want them |
 | Warning in the log when a host keeps pushing back | So that repeated 403/429 errors are visible |
 | Cloudflare blocks are labelled in the error column | To group failures by cause |
-| New file names: `<RW ID> - <title>.pdf` (ID zero-padded to 6 digits) | The folder sorts by Retraction Watch ID, every name is unique, and the title is still readable |
+| New file names: `<ID block>/<RW ID> - <title>.pdf` (ID zero-padded to 6 digits, title cut to 150 characters, subfolders of 1,000 IDs) | Everything sorts by Retraction Watch ID, every name is unique, the title is still readable, folders stay small enough to open quickly, and paths stay under Windows' 260-character limit |
 | New `index.csv` in the PDF folder, and `index` and `rename` commands | One table of all 69,740 entries (sorted by ID) with DOI, publisher, file name and status. It opens in Excel |
 | New `summary` command: `publisher_summary.csv` and `missing_by_publisher.csv` | Missing papers grouped by publisher (names from Crossref), with one main reason per paper, for the library request |
 
@@ -182,6 +182,4 @@ With the Wiley and Elsevier tokens, roughly half of the list looks reachable.
 
 1. Send `reports/missing_by_publisher.csv` and `reports/publisher_summary.csv` to the university library with the TDM request (Elsevier, Wiley/Hindawi, Springer Nature, IEEE).
 2. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
-3. Check that the Nextcloud upload is complete (7,006 files: 7,005 PDFs + `index.csv`).
-4. Shorten file names to at most 150 characters for the title part (existing and future PDFs).
-5. Retry the ~840 papers with temporary errors (timeouts, network errors, HTTP 5xx) with `--retry-failed` in a few days.
+3. Retry the ~840 papers with temporary errors (timeouts, network errors, HTTP 5xx) with `--retry-failed` in a few days.
