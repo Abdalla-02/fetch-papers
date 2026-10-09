@@ -67,6 +67,9 @@ DEFAULT_RPS = 0.5  # = one request every 2 s per publisher/repository host
 # page instead of a PDF) without a single success is skipped for the rest of the run.
 # Its papers end up as 'failed' and can be retried later with --retry-failed.
 BLOCK_AFTER = 8
+# A host that asks (Retry-After) for a longer pause than this is skipped for the rest of the run
+# instead of holding up all its papers.
+MAX_RETRY_AFTER = 120
 
 MAX_PDF_BYTES = 300 * 1024 * 1024
 TIMEOUT = httpx.Timeout(60.0, connect=20.0)
@@ -149,6 +152,8 @@ CREATE TABLE IF NOT EXISTS papers (
 );
 CREATE INDEX IF NOT EXISTS idx_status ON papers(status);
 CREATE TABLE IF NOT EXISTS no_doi (record_id TEXT PRIMARY KEY, title TEXT, raw_doi TEXT);
+-- result of 'verify' for each downloaded PDF (cleared when the PDF is downloaded again)
+CREATE TABLE IF NOT EXISTS checks (doi TEXT PRIMARY KEY, verdict TEXT, note TEXT, pages INTEGER, checked REAL);
 """
 
 
@@ -218,6 +223,13 @@ class HostLimiter:
     def is_blocked(self, url: str) -> bool:
         return (urlparse(url).hostname or "") in self.blocked
 
+    def block(self, url: str, reason: str):
+        """Stop contacting this host for the rest of the run."""
+        host = urlparse(url).hostname or ""
+        if host not in self.blocked:
+            self.blocked[host] = reason
+            print(f"! host {host}: {reason} - skipping it for the rest of this run", file=sys.stderr, flush=True)
+
     def refused(self, url: str, reason: str):
         """Download refused (403/429/bot check/HTML instead of PDF). Block host after BLOCK_AFTER in a row."""
         host = urlparse(url).hostname or ""
@@ -284,6 +296,8 @@ class Fetcher:
             if self.limiter.is_blocked(url):
                 raise HostBlocked(urlparse(url).hostname)
             await self.limiter.wait(url)
+            if self.limiter.is_blocked(url):  # blocked while we were waiting for our turn
+                raise HostBlocked(urlparse(url).hostname)
             h = headers if urlparse(url).hostname == first_host else \
                 {k: v for k, v in (headers or {}).items() if k.lower() == "accept"}
             resp = await client.send(client.build_request("GET", url, headers=h), stream=stream)
@@ -307,6 +321,11 @@ class Fetcher:
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < tries - 1:
                 ra = resp.headers.get("Retry-After", "")
                 wait = float(ra) if ra.isdigit() else 5 * (attempt + 1)
+                if wait > MAX_RETRY_AFTER:
+                    # e.g. "503, Retry-After: 3600": waiting would stall every paper on this host,
+                    # so leave the host alone for this run (the papers stay 'failed' and retryable)
+                    self.limiter.block(final, f"HTTP {resp.status_code}, asked to wait {int(wait)} s")
+                    return resp
                 self.limiter.slow_down(final, wait)
                 await resp.aclose()
                 continue  # the limiter now holds this host back for `wait` seconds
@@ -446,6 +465,8 @@ class Fetcher:
             "UPDATE papers SET status=?, source=?, pdf_url=?, error=?, attempts=attempts+1, updated=? WHERE doi=?",
             (status, source, url, error, time.time(), doi),
         )
+        if status == "done" and source != "already_on_disk":  # new file -> old check result is stale
+            self.con.execute("DELETE FROM checks WHERE doi=?", (doi,))
         self.con.commit()
 
     def progress(self, n_done, n_total):
@@ -457,14 +478,19 @@ class Fetcher:
               f"failed={self.stats['failed']}  {rate*60:.0f}/min  ETA {eta:.1f} h", flush=True)
 
     async def run(self):
-        statuses = ["pending"] + (["failed"] if self.a.retry_failed else []) \
+        retry_failed = self.a.retry_failed or self.a.retry_temporary
+        statuses = ["pending"] + (["failed"] if retry_failed else []) \
                    + (["not_found"] if self.a.retry_not_found else [])
-        sql = f"SELECT doi, filename FROM papers WHERE status IN ({','.join('?'*len(statuses))})"
+        sql = f"SELECT doi, filename, status, error FROM papers WHERE status IN ({','.join('?'*len(statuses))})"
         params = list(statuses)
         if self.a.prefix:
             sql += " AND doi LIKE ?"
             params.append(self.a.prefix.lower() + "%")
-        todo = self.con.execute(sql + " ORDER BY doi", params).fetchall()
+        rows = self.con.execute(sql + " ORDER BY doi", params).fetchall()
+        if self.a.retry_temporary and not self.a.retry_failed:
+            # only failures that may go away by themselves (timeouts, 5xx ...), not blocked sites
+            rows = [r for r in rows if r[2] != "failed" or classify(r[2], r[3]) in TEMPORARY_REASONS]
+        todo = [(doi, fn) for doi, fn, _, _ in rows]
         if self.a.limit:
             random.seed(0)
             random.shuffle(todo)
@@ -519,22 +545,24 @@ def cmd_run(args):
 
 # ----------------------------------------------------------------------------- index / rename
 INDEX_COLUMNS = ["rw_id", "all_rw_ids", "doi", "doi_prefix", "title", "folder", "filename",
-                 "status", "source", "pdf_url", "error"]
+                 "status", "pdf_check", "source", "pdf_url", "error"]
 
 
 def write_index(con, out: Path):
     """Write <out>/index.csv: one row per paper (incl. rows without DOI), sorted by RW ID.
-    'folder' and 'filename' are only filled for downloaded papers.
+    'folder', 'filename' and 'pdf_check' (result of 'verify') are only filled for downloaded papers.
     UTF-8 with BOM so Excel shows non-ASCII titles correctly."""
     rows = []
-    for doi, ids, title, fn, status, source, url, err in con.execute(
-            "SELECT doi, record_ids, title, filename, status, source, pdf_url, error FROM papers"):
+    for doi, ids, title, fn, status, check, source, url, err in con.execute(
+            "SELECT p.doi, record_ids, title, filename, status, c.verdict, source, pdf_url, error "
+            "FROM papers p LEFT JOIN checks c ON c.doi = p.doi"):
         folder, _, name = fn.rpartition("/")
         done = status == "done"
         rows.append([first_id(ids), ids, doi, doi.split("/")[0], title, folder if done else "",
-                     f"{name}.pdf" if done else "", status, source, url, (err or "")[:300]])
+                     f"{name}.pdf" if done else "", status, (check or "") if done else "",
+                     source, url, (err or "")[:300]])
     for rid, title, raw in con.execute("SELECT record_id, title, raw_doi FROM no_doi"):
-        rows.append([first_id(rid), rid, raw, "", title, "", "", "no_doi", "", "", "no usable DOI in the CSV"])
+        rows.append([first_id(rid), rid, raw, "", title, "", "", "no_doi", "", "", "", "no usable DOI in the CSV"])
     rows.sort(key=lambda r: r[0])
     out.mkdir(parents=True, exist_ok=True)
     tmp = out / "index.csv.part"
@@ -566,7 +594,12 @@ ROUTES = {
 REASONS = ["closed access (no open-access copy)", "blocked by bot protection (Cloudflare)",
            "refused by site (HTTP 401/403/429)", "HTML page instead of PDF",
            "network error / timeout (worth retrying)", "TLS certificate error on site",
-           "broken link (HTTP 404/410)", "index lookup error (worth retrying)", "other"]
+           "broken link (HTTP 404/410)", "index lookup error (worth retrying)", "other",
+           "PDF is only a retraction notice or first page"]
+# 'verify' verdicts meaning the downloaded PDF is not the full article
+INCOMPLETE_VERDICTS = ("notice", "short")
+# failures that may go away by themselves - retried with --retry-temporary
+TEMPORARY_REASONS = {REASONS[4], REASONS[7], REASONS[8]}
 
 
 def classify(status: str, error: str | None) -> str:
@@ -618,16 +651,20 @@ def cmd_summary(args):
     con = open_db(args.db)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    rows = con.execute("SELECT doi, record_ids, title, status, error FROM papers").fetchall()
+    rows = con.execute("SELECT p.doi, record_ids, title, status, error, c.verdict "
+                       "FROM papers p LEFT JOIN checks c ON c.doi = p.doi").fetchall()
     per = defaultdict(lambda: defaultdict(int))
     missing = []
-    for doi, ids, title, status, err in rows:
+    for doi, ids, title, status, err, check in rows:
         p = doi.split("/")[0]
         per[p]["total"] += 1
-        if status == "done":
+        if status == "done" and check not in INCOMPLETE_VERDICTS:
             per[p]["done"] += 1
             continue
-        reason = classify(status, err) if status != "pending" else "not processed yet"
+        if status == "done":  # downloaded, but 'verify' found only a notice / first page
+            status, reason = "pdf_incomplete", REASONS[-1]
+        else:
+            reason = classify(status, err) if status != "pending" else "not processed yet"
         per[p][reason] += 1
         missing.append((p, doi, first_id(ids), ids, title, status, reason))
     names = {} if args.no_names else publisher_names(con, sorted(per), args.email)
@@ -636,7 +673,7 @@ def cmd_summary(args):
 
     with open(out / "publisher_summary.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["doi_prefix", "publisher", "papers", "downloaded", "missing", "missing_%",
+        w.writerow(["doi_prefix", "publisher", "papers", "full_text_pdfs", "missing", "missing_%",
                     "suggested_route"] + REASONS)
         for p in order:
             d = per[p]
@@ -653,7 +690,9 @@ def cmd_summary(args):
 
     # console summary
     total, done = len(rows), sum(per[p]["done"] for p in per)
-    print(f"\npapers with DOI: {total}   downloaded: {done} ({100 * done / total:.1f}%)   missing: {total - done}")
+    incomplete = sum(per[p][REASONS[-1]] for p in per)
+    print(f"\npapers with DOI: {total}   full-text PDFs: {done} ({100 * done / total:.1f}%)   missing: {total - done}"
+          + (f"  (incl. {incomplete} PDFs that are only a notice / first page)" if incomplete else ""))
     print("\nmain reasons for missing PDFs:")
     reasons = defaultdict(int)
     for m in missing:
@@ -665,6 +704,123 @@ def cmd_summary(args):
         d = per[p]
         print(f"  {p:<9} {names.get(p, '')[:38]:<38} {d['total'] - d['done']:6} of {d['total']:6} missing")
     print(f"\nwritten: {out / 'publisher_summary.csv'}\n         {out / 'missing_by_publisher.csv'} ({len(missing)} rows)")
+
+
+# ----------------------------------------------------------------------------- verify downloaded PDFs
+VERIFY_PAGES = 3          # pages read from the start of each PDF
+LONG_PDF_PAGES = 60       # longer than this: probably a whole issue / supplement
+STOPWORDS = set("with from that this their between among into using based study analysis effect effects "
+                "role during after under over versus which through".split())
+VERDICT_ORDER = ["unreadable", "mismatch", "notice", "short", "check", "no_text", "ok"]
+# wording of retraction notices / notes (a "RETRACTED" watermark on a real article does not match)
+NOTICE_RE = re.compile(r"\bretraction\b|\bhas been retracted\b|\bwas retracted\b|\bis retracted\b|"
+                       r"\bhas been withdrawn\b|\bwas withdrawn\b|\bis withdrawn\b|\bwithdrawal\b|"
+                       r"\bretracts\b|\beditor s note\b")
+
+
+def _norm(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+    text = re.sub(r"-\s*\n\s*", "", text)          # words hyphenated across lines
+    return re.sub(r"[^a-z0-9]+", " ", text)
+
+
+def verify_pdf(path: str, title: str, doi: str) -> dict:
+    """Check one PDF: readable? text layer? title words and DOI on the first pages?"""
+    import logging
+    from pypdf import PdfReader
+    logging.getLogger("pypdf").setLevel(logging.ERROR)  # font warnings are not our problem
+    r = {"pages": 0, "title_match": "", "doi_in_pdf": "", "verdict": "", "note": ""}
+    try:
+        reader = PdfReader(path)
+        r["pages"] = len(reader.pages)
+        raw = "\n".join((reader.pages[i].extract_text() or "") for i in range(min(VERIFY_PAGES, r["pages"])))
+    except Exception as e:
+        r.update(verdict="unreadable", note=f"{type(e).__name__}: {e}"[:150])
+        return r
+    text = _norm(raw)
+    words = [w for w in _norm(title).split() if len(w) >= 4 and w not in STOPWORDS] or _norm(title).split()
+    have = set(text.split())
+    score = sum(w in have for w in words) / max(1, len(words))
+    doi_hit = doi.lower() in re.sub(r"\s+", "", raw.lower())
+    r["title_match"], r["doi_in_pdf"] = f"{score:.2f}", "yes" if doi_hit else "no"
+    notes = []
+    if len(text.strip()) < 200:
+        r["verdict"] = "no_text"
+        notes.append("no text layer (scanned?) - check by hand")
+    elif doi_hit or score >= 0.8:
+        r["verdict"] = "ok"
+    elif score >= 0.5:
+        r["verdict"] = "check"
+        notes.append("title only partly found")
+    else:
+        r["verdict"] = "mismatch"
+        notes.append("title and DOI not found - probably a different document")
+    if r["pages"] > LONG_PDF_PAGES:
+        notes.append(f"{r['pages']} pages - whole issue or supplement?")
+    if r["pages"] <= 2 and r["verdict"] in ("ok", "check", "mismatch"):
+        # a notice repeats the original title and DOI, so the checks above cannot tell it apart
+        if NOTICE_RE.search(text):
+            r["verdict"] = "notice"
+            notes[:] = ["1-2 pages that read like a retraction notice - probably not the article itself"]
+        elif r["verdict"] != "mismatch":
+            r["verdict"] = "short"
+            notes.append("only 1-2 pages - a short article, or just the first page / abstract")
+    r["note"] = "; ".join(notes)
+    return r
+
+
+def cmd_verify(args):
+    """Check every downloaded PDF against its title and DOI; write <out-dir>/verify.csv."""
+    try:
+        import pypdf  # noqa: F401
+    except ImportError:
+        sys.exit("verify needs pypdf:  pip install pypdf")
+    from concurrent.futures import ProcessPoolExecutor
+    con = open_db(args.db)
+    out, rep = Path(args.out), Path(args.out_dir)
+    rep.mkdir(parents=True, exist_ok=True)
+    papers = con.execute("SELECT doi, record_ids, title, filename FROM papers WHERE status='done'").fetchall()
+    if args.limit:
+        papers = papers[:args.limit]
+    print(f"checking {len(papers)} PDFs with {args.workers} processes ...", flush=True)
+    results = []
+    with ProcessPoolExecutor(args.workers) as pool:
+        jobs = [(p, pool.submit(verify_pdf, str(out / f"{p[3]}.pdf"), p[2] or "", p[0])) for p in papers]
+        for i, (p, job) in enumerate(jobs, 1):
+            try:
+                r = job.result()
+            except Exception as e:  # e.g. a worker crashed on a malformed PDF
+                r = {"pages": 0, "title_match": "", "doi_in_pdf": "", "verdict": "unreadable",
+                     "note": f"{type(e).__name__}: {e}"[:150]}
+            results.append((p, r))
+            if i % 500 == 0:
+                print(f"  {i}/{len(papers)}", flush=True)
+    results.sort(key=lambda x: (VERDICT_ORDER.index(x[1]["verdict"]), first_id(x[0][1])))
+    with con:  # keep the verdicts, so index.csv and summary can use them
+        con.executemany("INSERT OR REPLACE INTO checks VALUES (?,?,?,?,?)",
+                        [(p[0], r["verdict"], r["note"], r["pages"], time.time()) for p, r in results])
+    with open(rep / "verify.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["verdict", "note", "rw_id", "doi", "title", "folder", "filename", "pages",
+                     "title_match", "doi_in_pdf", "size_kb"])
+        for (doi, ids, title, fn), r in results:
+            folder, _, name = fn.rpartition("/")
+            path = out / f"{fn}.pdf"
+            size = path.stat().st_size // 1024 if path.exists() else ""
+            w.writerow([r["verdict"], r["note"], first_id(ids), doi, title, folder, f"{name}.pdf",
+                        r["pages"], r["title_match"], r["doi_in_pdf"], size])
+    counts = defaultdict(int)
+    for _, r in results:
+        counts[r["verdict"]] += 1
+    print("\nresult:")
+    for v in VERDICT_ORDER:
+        print(f"  {v:<11} {counts[v]}")
+    long_ = sum(1 for _, r in results if "whole issue" in r["note"])
+    print(f"  (note: {long_} very long PDFs - whole issue or supplement?)")
+    print(f"written: {rep / 'verify.csv'}")
+    if not args.limit:
+        write_index(con, out)  # adds the verdicts as column 'pdf_check'
 
 
 def cmd_rename(args):
@@ -750,7 +906,10 @@ def main():
     r.add_argument("--concurrency", type=int, default=16)
     r.add_argument("--limit", type=int, help="only process N random DOIs (for a test run)")
     r.add_argument("--prefix", help="only DOIs starting with this, e.g. 10.1155")
-    r.add_argument("--retry-failed", action="store_true")
+    r.add_argument("--retry-failed", action="store_true", help="retry all failed papers")
+    r.add_argument("--retry-temporary", action="store_true",
+                   help="retry only failures that may be temporary (timeouts, network errors, HTTP 5xx), "
+                        "not papers on sites that blocked us")
     r.add_argument("--retry-not-found", action="store_true")
     r.add_argument("--progress-every", type=int, default=50)
     r.add_argument("-v", "--verbose", action="store_true")
@@ -759,6 +918,13 @@ def main():
     s = sub.add_parser("report", help="show progress / export status CSV")
     s.add_argument("--export", help="write per-paper status to this CSV")
     s.set_defaults(func=cmd_report)
+
+    v = sub.add_parser("verify", help="check downloaded PDFs against their title and DOI (needs pypdf)")
+    v.add_argument("--out", required=True, help="the PDF folder")
+    v.add_argument("--out-dir", default="reports", help="folder for verify.csv (default: reports)")
+    v.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    v.add_argument("--limit", type=int, help="only check the first N PDFs (for a test)")
+    v.set_defaults(func=cmd_verify)
 
     x = sub.add_parser("index", help="write index.csv (all papers, sorted by RW ID) into the PDF folder")
     x.add_argument("--out", required=True, help="the PDF folder")
