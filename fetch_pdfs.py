@@ -54,6 +54,8 @@ WILEY = os.environ.get("WILEY_BASE", "https://api.wiley.com")
 CROSSREF = os.environ.get("CROSSREF_BASE", "https://api.crossref.org")
 
 ALL_SOURCES = ["unpaywall", "openalex", "elsevier", "wiley", "crossref"]
+# the index/TDM APIs themselves (as opposed to publisher and repository sites)
+API_HOSTS = {urlparse(base).hostname for base in (UNPAYWALL, OPENALEX, ELSEVIER, WILEY, CROSSREF)}
 
 # Requests per second allowed per host. Anything not listed uses DEFAULT_RPS.
 # Keep publisher sites slow: this is what keeps you from being blocked.
@@ -270,6 +272,11 @@ class HostLimiter:
 
 
 # ----------------------------------------------------------------------------- downloader
+class StopRun(Exception):
+    """An index/TDM API (a host in API_HOSTS) asked for a long pause, e.g. a daily quota.
+    The run stops cleanly; papers not processed yet keep their status for the next run."""
+
+
 class HostBlocked(Exception):
     """The host was skipped because it kept refusing downloads (see BLOCK_AFTER)."""
 
@@ -288,6 +295,7 @@ class Fetcher:
         self.ua = f"RetractedPapersResearch/1.0 (mailto:{args.email})"
         self.stats = defaultdict(int)
         self.t0 = time.time()
+        self.stop_reason = ""  # set when an API asks for a long pause (StopRun)
 
     # -- HTTP with retries -------------------------------------------------
     async def send(self, client, url, headers, stream, max_hops=10):
@@ -315,7 +323,7 @@ class Fetcher:
         for attempt in range(tries):
             try:
                 resp = await self.send(client, url, headers, stream)
-            except (httpx.TransportError, httpx.TimeoutException) as e:
+            except (httpx.TransportError, httpx.TimeoutException):
                 if attempt == tries - 1:
                     raise
                 await asyncio.sleep(2 ** attempt + random.random())
@@ -325,9 +333,15 @@ class Fetcher:
                 ra = resp.headers.get("Retry-After", "")
                 wait = float(ra) if ra.isdigit() else 5 * (attempt + 1)
                 if wait > MAX_RETRY_AFTER:
-                    # e.g. "503, Retry-After: 3600": waiting would stall every paper on this host,
-                    # so leave the host alone for this run (the papers stay 'failed' and retryable)
-                    self.limiter.block(final, f"HTTP {resp.status_code}, asked to wait {int(wait)} s")
+                    reason = f"HTTP {resp.status_code}, asked to wait {int(wait)} s"
+                    if (urlparse(final).hostname or "") in API_HOSTS:
+                        # one of our index/TDM APIs (probably a quota): skipping it would mark every
+                        # remaining paper as failed without a real lookup, so stop the run instead
+                        await resp.aclose()
+                        raise StopRun(f"{urlparse(final).hostname}: {reason}")
+                    # a publisher/repository site, e.g. "503, Retry-After: 3600": waiting would stall
+                    # every paper on it, so leave it alone for this run (papers stay 'failed', retryable)
+                    self.limiter.block(final, reason)
                     return resp
                 self.limiter.slow_down(final, wait)
                 await resp.aclose()
@@ -384,6 +398,8 @@ class Fetcher:
                     for link in ((j or {}).get("message", {}).get("link") or []):
                         if "pdf" in (link.get("content-type") or "") and link.get("URL"):
                             yield "crossref", link["URL"], None
+            except StopRun:
+                raise
             except Exception as e:  # a broken index lookup must not kill the paper
                 self.stats[f"lookup_error_{src}"] += 1
                 lookup_errors.append(f"{src}: lookup failed: {type(e).__name__}: {e}"[:300])
@@ -447,6 +463,8 @@ class Fetcher:
             tried.add(url)
             try:
                 err = await self.download(client, url, headers, dest)
+            except StopRun:
+                raise
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
             if err is None:
@@ -516,12 +534,16 @@ class Fetcher:
                                      headers={"User-Agent": self.ua}) as client:
             async def worker():
                 nonlocal done
-                while True:
+                while not self.stop_reason:
                     try:
                         doi, fn = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         return
-                    await self.process(client, doi, fn)
+                    try:
+                        await self.process(client, doi, fn)
+                    except StopRun as e:  # this paper is not saved, so it keeps its old status
+                        self.stop_reason = self.stop_reason or str(e)
+                        return
                     done += 1
                     if done % self.a.progress_every == 0 or done == total:
                         self.progress(done, total)
@@ -529,7 +551,11 @@ class Fetcher:
             await asyncio.gather(*(worker() for _ in range(self.a.concurrency)))
         print("finished:", dict(self.stats))
         for host, reason in self.limiter.blocked.items():
-            print(f"blocked host (skipped after {BLOCK_AFTER} refusals in a row): {host} - {reason}")
+            print(f"blocked host (skipped for the rest of the run): {host} - {reason}")
+        if self.stop_reason:
+            print(f"STOPPED EARLY after {done} of {total} DOIs - {self.stop_reason}. This is probably a rate "
+                  f"limit or quota; the remaining papers are untouched, run the same command again later.",
+                  flush=True)
 
 
 def cmd_run(args):
@@ -539,11 +565,14 @@ def cmd_run(args):
     if not con.execute("SELECT COUNT(*) FROM papers").fetchone()[0]:
         # a wrong --db path would otherwise create an empty DB and overwrite index.csv with nothing
         sys.exit(f"{os.path.abspath(args.db)} contains no papers - run 'import' first or check --db")
+    fetcher = Fetcher(args, con)
     try:
-        asyncio.run(Fetcher(args, con).run())
+        asyncio.run(fetcher.run())
     except KeyboardInterrupt:
         print("\nstopped - progress is saved, just run the same command again to resume")
     write_index(con, Path(args.out))
+    if fetcher.stop_reason:
+        sys.exit(3)  # non-zero, so a launcher log shows that the run did not finish
 
 
 # ----------------------------------------------------------------------------- index / rename
@@ -775,10 +804,9 @@ def verify_pdf(path: str, title: str, doi: str) -> dict:
 
 def cmd_verify(args):
     """Check every downloaded PDF against its title and DOI; write <out-dir>/verify.csv."""
-    try:
-        import pypdf  # noqa: F401
-    except ImportError:
-        sys.exit("verify needs pypdf:  pip install pypdf")
+    import importlib.util
+    if importlib.util.find_spec("pypdf") is None:
+        sys.exit("verify needs pypdf:  pip install pypdf cryptography")
     from concurrent.futures import ProcessPoolExecutor
     con = open_db(args.db)
     out, rep = Path(args.out), Path(args.out_dir)

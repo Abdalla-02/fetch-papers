@@ -169,8 +169,16 @@ rclone copy /data/retracted_pdfs cloud:RetractedPapers --progress   # repeat aft
 - **No fake PDFs:** a file is saved only if its first kilobyte contains `%PDF`. HTML login and bot-check pages are rejected and logged as `not a PDF`.
 - **Polite rate limits:** each server gets its own speed limit (`HOST_RPS` and `DEFAULT_RPS` at the top of the script). Publisher sites get one request every 2 seconds; the Wiley TDM API one every 10 seconds (its limit is 60 per 10 minutes). Redirects are followed one hop at a time, so the limit applies to the server that actually answers, and API keys are never forwarded to another host. When a site answers 429 or 403, the script slows down for that site and speeds up again once requests succeed; a line starting with `! host … keeps pushing back` appears in the log.
 - **Blocked hosts:** if a host refuses `BLOCK_AFTER` (8) downloads in a row (403/429, a Cloudflare "Just a moment…" challenge, or an HTML page instead of a PDF), it is skipped for the rest of the run and the log shows `! host … skipping it for the rest of this run`. Its papers are marked `failed` with `skipped: … blocked for this run`, so `--retry-failed` (or Phase B) can pick them up later. The script never tries to get past such a block. In Phase A, 58 hosts were skipped this way, among them `downloads.hindawi.com`, `onlinelibrary.wiley.com` and `www.sciencedirect.com`.
-- **Long pauses requested by a server:** a 429/5xx answer with `Retry-After` up to `MAX_RETRY_AFTER` (120 s) is respected by pausing that host. If a server asks for a longer pause (for example "503, Retry-After: 3600"), the host is skipped for the rest of the run instead, so its papers don't hold up the whole run; they stay `failed` and can be retried later.
+- **Long pauses requested by a server:** a 429/5xx answer with `Retry-After` up to `MAX_RETRY_AFTER` (120 s) is respected by pausing that host. If a publisher or repository site asks for a longer pause (for example "503, Retry-After: 3600"), it is skipped for the rest of the run instead, so its papers don't hold up the whole run; they stay `failed` and can be retried later. If one of the APIs themselves (Unpaywall, OpenAlex, Crossref, Elsevier, Wiley) asks for a longer pause, which usually means a quota is used up, the run **stops cleanly** with a `STOPPED EARLY` message and exit code 3; the papers not reached yet keep their status, so running the same command later simply continues.
 - **Statuses:**
   - `done`: the PDF was saved
   - `not_found`: no source had a PDF link
   - `failed`: a link existed but the download failed, or an index lookup failed (the reason is in the `error` column)
+
+## 6. Tests
+
+```bash
+python tests/test_fetch_pdfs.py
+```
+
+The tests run offline against a small local web server that plays Unpaywall and some publisher sites. They check the file naming, the classification of failures, that a Cloudflare-blocked site gets exactly 8 requests and is then skipped, that API keys are not forwarded across redirects, that PDFs land in their ID-block folder, both kinds of long `Retry-After` (site skipped / run stopped), and the `verify` verdicts on small generated PDFs. Run them after every change to the script.
