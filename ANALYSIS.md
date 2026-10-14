@@ -7,8 +7,8 @@
 - The Retraction Watch list has **63,790 unique DOIs** (72,790 rows; 5,950 rows have no usable DOI).
 - **Phase A downloaded 7,005 PDFs (11.0%, 17.1 GB)** from open-access sources in 3 h 24 min, with no crashes and no API errors. A retry one week later added 172 (7,177 in total).
 - **Quality check (week 2): 1,146 of these PDFs are only the retraction notice or the article's first page**, not the article. So **6,031 papers (9.5%) have a full-text PDF**; 57,759 are still missing (see section 5).
-- Of the missing papers, **35,367 (62%) have no open-access copy at all**, and **19,811 (35%) have an open-access link, but the publisher's site refused the download**, mostly through Cloudflare or similar bot protection.
-- The biggest single group, **Hindawi (11,749 missing, 21% of all missing papers)**, is open access (CC-BY), but its download server is behind a Cloudflare bot check. The legal way to get these papers is the Wiley TDM API; Hindawi is now part of Wiley.
+- Of the 57,759 missing papers, **35,367 (61%) have no open-access copy at all**, **19,836 (34%) have an open-access link, but the publisher's site refused the download**, mostly through Cloudflare or similar bot protection, and 1,146 (2%) have only a notice / first page as PDF.
+- The biggest single group, **Hindawi (11,757 missing, 20% of all missing papers)**, is open access (CC-BY), but its download server is behind a Cloudflare bot check. Hindawi is now part of Wiley, so the Wiley TDM API may provide these papers; this will be tested as soon as a token is available.
 - Most of the remaining papers can only be obtained legally through the publishers' text-and-data-mining (TDM) APIs. That needs tokens arranged through the university library. The per-publisher list for the library is in `reports/missing_by_publisher.csv`.
 
 ## 2. Input data
@@ -180,9 +180,13 @@ The verdicts are stored in the database (table `checks`), shown in `index.csv` (
 | Cloudflare blocks are labelled in the error column | To group failures by cause |
 | New file names: `<ID block>/<RW ID> - <title>.pdf` (ID zero-padded to 6 digits, title cut to 150 characters, subfolders of 1,000 IDs) | Everything sorts by Retraction Watch ID, every name is unique, the title is still readable, folders stay small enough to open quickly, and paths stay under Windows' 260-character limit |
 | New `index.csv` in the PDF folder, and `index` and `rename` commands | One table of all 69,740 entries (sorted by ID) with DOI, publisher, file name and status. It opens in Excel |
+| New `verify` command (week 2): checks every PDF against its title and DOI; verdicts stored in table `checks`, column `pdf_check` in `index.csv` and `reports/verify.csv` | Found 1,146 PDFs that are only a retraction notice or first page, and 54 that are probably a different document |
+| `summary` counts notice / first-page-only PDFs as missing (status `pdf_incomplete`); column `downloaded` renamed to `full_text_pdfs` | The library list must include papers whose full text is still missing |
+| New option `run --retry-temporary` (week 2) | Retries only timeouts, network and server errors, without contacting the sites that blocked us again |
+| A server asking for a pause (`Retry-After`) longer than 120 s is skipped for the rest of the run (week 2) | A server answering "503, Retry-After: 3600" stalled the retry run for hours |
 | New `summary` command: `publisher_summary.csv` and `missing_by_publisher.csv` | Missing papers grouped by publisher (names from Crossref), with one main reason per paper, for the library request |
 
-All changes were tested: the bug fixes and blocked-host handling against a local mock server and the real APIs, and the renaming on a copy of the data first. A fresh import produces exactly the same file names as the rename.
+All changes were tested: the bug fixes, blocked-host and Retry-After handling against a local mock server and the real APIs; the renaming, the `checks` table and `summary` on a copy of the data first; the `verify` verdicts by reading samples of the flagged PDFs. A fresh import produces exactly the same file names as the rename.
 
 Things that were deliberately **not** done: no browser automation (e.g. Puppeteer), no getting past Cloudflare or CAPTCHAs, no logging in with the university account. Publisher licences forbid this, and it could get the university's IP range blocked.
 

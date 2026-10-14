@@ -16,13 +16,16 @@ Usage:
   python fetch_pdfs.py import  retraction_watch.csv
   python fetch_pdfs.py run     --email you@uni.de --out /data/retracted_pdfs
   python fetch_pdfs.py report  [--export status.csv]
+  python fetch_pdfs.py run     ... --retry-temporary              (retry timeouts / server errors)
+  python fetch_pdfs.py verify  --out /data/retracted_pdfs        (check PDFs, writes reports/verify.csv)
+  python fetch_pdfs.py summary --out-dir reports --email you@uni.de   (lists for the library)
   python fetch_pdfs.py index   --out /data/retracted_pdfs        (writes index.csv)
   python fetch_pdfs.py rename  --out /data/retracted_pdfs [--dry-run]
 
 PDFs are saved as '<ID block>/<RW ID> - <title>.pdf' (title cut to 150 characters),
 e.g. '001001-002000/001454 - Circulatory Responses ....pdf'.
 
-Requires: Python 3.9+, `pip install httpx`
+Requires: Python 3.9+, `pip install httpx` (and `pip install pypdf cryptography` for 'verify')
 """
 from __future__ import annotations
 
