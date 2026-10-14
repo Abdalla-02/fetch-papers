@@ -1,13 +1,14 @@
 # Retracted-papers PDF download: analysis report
 
-*Status: 2 October 2026. Phase A (open access) is complete. Phase B (publisher TDM APIs) is waiting for API tokens from the library.*
+*Status: 9 October 2026 (week 2). Phase A (open access) and a retry of temporary failures are complete, and every PDF has been checked. Phase B (publisher TDM APIs) is waiting for API tokens from the library.*
 
 ## 1. Summary
 
 - The Retraction Watch list has **63,790 unique DOIs** (72,790 rows; 5,950 rows have no usable DOI).
-- **Phase A downloaded 7,005 PDFs (11.0%, 17.1 GB)** from open-access sources in 3 h 24 min, with no crashes and no API errors. 56,785 papers are still missing.
-- Of the missing papers, **35,367 (62%) have no open-access copy at all**, and **19,811 (35%) have an open-access link, but the publisher's site refused the download**, mostly through Cloudflare or similar bot protection.
-- The biggest single group, **Hindawi (11,749 missing, 21% of all missing papers)**, is open access (CC-BY), but its download server is behind a Cloudflare bot check. The legal way to get these papers is the Wiley TDM API; Hindawi is now part of Wiley.
+- **Phase A downloaded 7,005 PDFs (11.0%, 17.1 GB)** from open-access sources in 3 h 24 min, with no crashes and no API errors. A retry one week later added 172 (7,177 in total).
+- **Quality check (week 2): 1,146 of these PDFs are only the retraction notice or the article's first page**, not the article. So **6,031 papers (9.5%) have a full-text PDF**; 57,759 are still missing (see section 5).
+- Of the 57,759 missing papers, **35,367 (61%) have no open-access copy at all**, **19,836 (34%) have an open-access link, but the publisher's site refused the download**, mostly through Cloudflare or similar bot protection, and 1,146 (2%) have only a notice / first page as PDF.
+- The biggest single group, **Hindawi (11,757 missing, 20% of all missing papers)**, is open access (CC-BY), but its download server is behind a Cloudflare bot check. Hindawi is now part of Wiley, so the Wiley TDM API may provide these papers; this will be tested as soon as a token is available.
 - Most of the remaining papers can only be obtained legally through the publishers' text-and-data-mining (TDM) APIs. That needs tokens arranged through the university library. The per-publisher list for the library is in `reports/missing_by_publisher.csv`.
 
 ## 2. Input data
@@ -143,7 +144,29 @@ The PDFs and `index.csv` are in the shared Nextcloud folder (`Retracted_Papers`)
 
 Wiley (incl. Hindawi) and Elsevier together account for **23,497 missing papers (41%)**, and both have official TDM APIs. IEEE, Springer Nature, T&F, SAGE and IOS Press need a library arrangement.
 
-## 5. Changes made to `fetch_pdfs.py`
+## 5. Week 2: retry and quality check
+
+**Retry of temporary failures** (`--retry-temporary`): the 841 papers that had failed with timeouts, network or server errors were tried again one week later. 172 more PDFs were downloaded (7,177 in total). 669 still failed; 495 of them are Spandidos Publications papers, whose server did not accept connections at all (it had refused downloads in Phase A too), so no further attempts were made there.
+
+During this run, `riviste.unimi.it` answered "503, Retry-After: 3600". The script obeyed literally and waited an hour per attempt, which stalled the end of the run. Fixed: a server asking for more than `MAX_RETRY_AFTER` (120 s) is now skipped for the rest of the run.
+
+**Quality check of every PDF** (`verify`): the first three pages of each PDF are compared with the paper's title and DOI. Result for 7,177 PDFs:
+
+| Result | PDFs | Meaning |
+|---|---|---|
+| ok | 5,936 | Title or DOI found: the expected paper |
+| notice | 948 | 1–2 pages that read like a retraction notice: the link gave the notice, not the article |
+| short | 198 | 1–2 pages, not a notice: mostly only the first page of the article with a "RETRACTED ARTICLE" stamp |
+| mismatch | 54 | Neither title nor DOI found: often a different document, sometimes a paper in another language |
+| no_text | 28 | Scanned PDF without a text layer |
+| check | 13 | Title only partly found |
+| unreadable | 0 | (encrypted PDFs are read with the `cryptography` package) |
+
+So **1,146 PDFs (16%) are not the full article**. Some publishers replace retracted articles with the notice or a stamped first page, and the open-access indexes link to that file; Springer (852 of its 1,189 PDFs) is by far the largest source. A spot check of randomly chosen files confirmed this: of 23 files marked `notice` or `short`, at least 19 were clearly not the full article; of 8 `mismatch` files, about half were clearly a different document. With these counted as missing, **6,031 papers (9.5%) have a full-text PDF**.
+
+The verdicts are stored in the database (table `checks`), shown in `index.csv` (column `pdf_check`) and listed in `reports/verify.csv`. `summary` counts the notice/first-page PDFs as missing, so the library list includes them.
+
+## 6. Changes made to `fetch_pdfs.py`
 
 | Change | Why |
 |---|---|
@@ -157,18 +180,23 @@ Wiley (incl. Hindawi) and Elsevier together account for **23,497 missing papers 
 | Cloudflare blocks are labelled in the error column | To group failures by cause |
 | New file names: `<ID block>/<RW ID> - <title>.pdf` (ID zero-padded to 6 digits, title cut to 150 characters, subfolders of 1,000 IDs) | Everything sorts by Retraction Watch ID, every name is unique, the title is still readable, folders stay small enough to open quickly, and paths stay under Windows' 260-character limit |
 | New `index.csv` in the PDF folder, and `index` and `rename` commands | One table of all 69,740 entries (sorted by ID) with DOI, publisher, file name and status. It opens in Excel |
+| New `verify` command (week 2): checks every PDF against its title and DOI; verdicts stored in table `checks`, column `pdf_check` in `index.csv` and `reports/verify.csv` | Found 1,146 PDFs that are only a retraction notice or first page, and 54 that are probably a different document |
+| `summary` counts notice / first-page-only PDFs as missing (status `pdf_incomplete`); column `downloaded` renamed to `full_text_pdfs` | The library list must include papers whose full text is still missing |
+| New option `run --retry-temporary` (week 2) | Retries only timeouts, network and server errors, without contacting the sites that blocked us again |
+| A site asking for a pause (`Retry-After`) longer than 120 s is skipped for the rest of the run; if one of the APIs asks for it (e.g. a quota), the run stops cleanly and leaves the remaining papers untouched (week 2) | A server answering "503, Retry-After: 3600" stalled the retry run for hours; skipping an API instead would have marked every remaining paper as failed |
+| Offline test suite `tests/test_fetch_pdfs.py` (week 2) | The checks done so far by hand (blocking, no key leak, Retry-After, subfolders, verify) can be rerun after every change |
 | New `summary` command: `publisher_summary.csv` and `missing_by_publisher.csv` | Missing papers grouped by publisher (names from Crossref), with one main reason per paper, for the library request |
 
-All changes were tested: the bug fixes and blocked-host handling against a local mock server and the real APIs, and the renaming on a copy of the data first. A fresh import produces exactly the same file names as the rename.
+All changes were tested: the bug fixes, blocked-host and Retry-After handling against a local mock server and the real APIs; the renaming, the `checks` table and `summary` on a copy of the data first; the `verify` verdicts by reading samples of the flagged PDFs. A fresh import produces exactly the same file names as the rename.
 
 Things that were deliberately **not** done: no browser automation (e.g. Puppeteer), no getting past Cloudflare or CAPTCHAs, no logging in with the university account. Publisher licences forbid this, and it could get the university's IP range blocked.
 
-## 6. Next steps
+## 7. Next steps
 
 | Phase | Source | Result / expected | Needs |
 |---|---|---|---|
 | A | Unpaywall + OpenAlex (open access) | **done: 7,005 PDFs (11%)** | – |
-| A (retry) | same, `--retry-failed` in a few days | up to ~840 (timeouts, network errors, HTTP 5xx) | nothing |
+| A (retry) | same, `--retry-temporary` | **done: 172 more PDFs** (7,177 in total; 1,146 of them only a notice / first page) | – |
 | B | Wiley TDM (incl. Hindawi, if Wiley serves 10.1155) | up to ~15,400 | Wiley TDM token |
 | B | Elsevier API | up to ~8,000 | Elsevier API key + institutional token |
 | C | Crossref full-text links | depends on licences | library approval, university network |
@@ -180,6 +208,8 @@ With the Wiley and Elsevier tokens, roughly half of the list looks reachable.
 
 **Open items:**
 
-1. Send `reports/missing_by_publisher.csv` and `reports/publisher_summary.csv` to the university library with the TDM request (Elsevier, Wiley/Hindawi, Springer Nature, IEEE).
-2. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
-3. Retry the ~840 papers with temporary errors (timeouts, network errors, HTTP 5xx) with `--retry-failed` in a few days.
+1. Library request (by the supervisor, after their return): send `reports/missing_by_publisher.csv` and `reports/publisher_summary.csv` with the TDM request (Elsevier, Wiley/Hindawi, Springer Nature, IEEE). The list now includes the 1,146 papers whose PDF is only a notice or first page.
+2. Decide how to handle the notice-only PDFs. Proposal: keep them, marked as `[notice]` in the file name, so the real article can be saved when it is obtained.
+3. Check the 54 `mismatch` PDFs by hand.
+4. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
+5. Look up DOIs for the 5,950 entries without one (Crossref title search with strict matching).

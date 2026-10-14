@@ -1,1 +1,4 @@
 httpx>=0.27
+# only for the 'verify' command:
+pypdf>=4
+cryptography>=3.1
