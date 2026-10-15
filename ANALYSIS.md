@@ -184,6 +184,9 @@ The verdicts are stored in the database (table `checks`), shown in `index.csv` (
 | `summary` counts notice / first-page-only PDFs as missing (status `pdf_incomplete`); column `downloaded` renamed to `full_text_pdfs` | The library list must include papers whose full text is still missing |
 | New option `run --retry-temporary` (week 2) | Retries only timeouts, network and server errors, without contacting the sites that blocked us again |
 | A site asking for a pause (`Retry-After`) longer than 120 s is skipped for the rest of the run; if one of the APIs asks for it (e.g. a quota), the run stops cleanly and leaves the remaining papers untouched (week 2) | A server answering "503, Retry-After: 3600" stalled the retry run for hours; skipping an API instead would have marked every remaining paper as failed |
+| Phase B preparation (week 3): API keys from a `.env` file (`.env.example` in the repo), `--wiley-prefixes` (Hindawi `10.1155` can be switched on after a test), status `incomplete` with `mark-incomplete` and `--retry-incomplete`, Windows template `windows/run_phase_b.cmd` | Phase B can start as soon as the keys arrive; notice-only papers get a second chance through the APIs while the notice files are kept |
+| A rejected API key (HTTP 401) or an API still answering 429 after retries stops the run; papers that no selected source can handle are not touched (week 3) | A wrong key or a used-up quota must not turn thousands of papers into 'failed', and a Phase B run must not overwrite the Phase A reasons of papers it cannot handle |
+| `verify` warns about files renamed to a Windows short name like `049929~1.PDF` (week 3) | The Nextcloud client renamed one PDF this way |
 | Offline test suite `tests/test_fetch_pdfs.py` (week 2) | The checks done so far by hand (blocking, no key leak, Retry-After, subfolders, verify) can be rerun after every change |
 | New `summary` command: `publisher_summary.csv` and `missing_by_publisher.csv` | Missing papers grouped by publisher (names from Crossref), with one main reason per paper, for the library request |
 
@@ -209,7 +212,7 @@ With the Wiley and Elsevier tokens, roughly half of the list looks reachable.
 **Open items:**
 
 1. Library request (by the supervisor, after their return): send `reports/missing_by_publisher.csv` and `reports/publisher_summary.csv` with the TDM request (Elsevier, Wiley/Hindawi, Springer Nature, IEEE). The list now includes the 1,146 papers whose PDF is only a notice or first page.
-2. Decide how to handle the notice-only PDFs. Proposal: keep them, marked as `[notice]` in the file name, so the real article can be saved when it is obtained.
+2. Decide how to handle the notice-only PDFs. Decided (option A): keep them, marked with the status right after the ID (`<ID> [notice] - <title>.pdf`), so the real article can be saved when it is obtained.
 3. Check the 54 `mismatch` PDFs by hand.
 4. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
 5. Look up DOIs for the 5,950 entries without one (Crossref title search with strict matching).
