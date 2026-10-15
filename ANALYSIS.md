@@ -212,7 +212,7 @@ With the Wiley and Elsevier tokens, roughly half of the list looks reachable.
 **Open items:**
 
 1. Library request (by the supervisor, after their return): send `reports/missing_by_publisher.csv` and `reports/publisher_summary.csv` with the TDM request (Elsevier, Wiley/Hindawi, Springer Nature, IEEE). The list now includes the 1,146 papers whose PDF is only a notice or first page.
-2. Decide how to handle the notice-only PDFs. Proposal: keep them, marked as `[notice]` in the file name, so the real article can be saved when it is obtained.
+2. Decide how to handle the notice-only PDFs. Decided (option A): keep them, marked with the status right after the ID (`<ID> [notice] - <title>.pdf`), so the real article can be saved when it is obtained.
 3. Check the 54 `mismatch` PDFs by hand.
 4. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
 5. Look up DOIs for the 5,950 entries without one (Crossref title search with strict matching).

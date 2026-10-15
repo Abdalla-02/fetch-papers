@@ -270,15 +270,17 @@ def test_mark_incomplete_and_retry():
     st = dict(con.execute("SELECT doi, status FROM papers"))
     assert st == {"10.1016/els-1": "incomplete", "10.9999/x-2": "incomplete", "10.9999/x-3": "done"}, st
     fn1 = con.execute("SELECT filename FROM papers WHERE doi='10.1016/els-1'").fetchone()[0]
-    assert (out / f"{fn1} [notice].pdf").exists() and not (out / f"{fn1}.pdf").exists()
+    marked1 = F.marked_name(fn1, "notice")
+    assert marked1.endswith("000001 [notice] - Title 1"), marked1          # status right after the ID
+    assert (out / f"{marked1}.pdf").exists() and not (out / f"{fn1}.pdf").exists()
     index = (out / "index.csv").read_text(encoding="utf-8-sig")
-    assert "[notice].pdf" in index and "[first page].pdf" in index
+    assert "000001 [notice] - Title 1.pdf" in index and "000002 [first page] - Title 2.pdf" in index
     # a later Phase B run fetches the real article for the Elsevier paper; the other stays 'incomplete'
     with env(ELSEVIER_API_KEY="good"):
         run_fetcher(con, "incomplete", sources="elsevier", retry_incomplete=True)
     st = dict(con.execute("SELECT doi, status FROM papers"))
     assert st == {"10.1016/els-1": "done", "10.9999/x-2": "incomplete", "10.9999/x-3": "done"}, st
-    assert (out / f"{fn1}.pdf").exists() and (out / f"{fn1} [notice].pdf").exists()   # notice is kept
+    assert (out / f"{fn1}.pdf").exists() and (out / f"{marked1}.pdf").exists()   # notice is kept
     assert con.execute("SELECT source FROM papers WHERE doi='10.9999/x-2'").fetchone()[0] == "unpaywall"
     assert con.execute("SELECT COUNT(*) FROM checks WHERE doi='10.1016/els-1'").fetchone()[0] == 0  # re-check
 

@@ -84,7 +84,7 @@ The note column also flags PDFs with more than 60 pages (probably a whole issue 
    python fetch_pdfs.py mark-incomplete --out /data/retracted_pdfs --dry-run   # shows what would change
    python fetch_pdfs.py mark-incomplete --out /data/retracted_pdfs
    ```
-   Each such PDF is kept, renamed to `… [notice].pdf` or `… [first page].pdf`, and its paper gets status `incomplete`. Nothing is deleted.
+   Each such PDF is kept, renamed with its status right after the ID (e.g. `001454 [notice] - Title.pdf` or `001454 [first page] - Title.pdf`, so it still sorts by ID), and its paper gets status `incomplete`. Nothing is deleted.
 3. **Small test first** (20 papers per publisher), then look at the log and the new PDFs:
    ```bash
    python fetch_pdfs.py run --email you@uni.de --out /data/retracted_pdfs --sources elsevier,wiley \
@@ -133,7 +133,7 @@ python fetch_pdfs.py report                             # counts per status and 
 | `summary --out-dir reports --email …` | Per-publisher summary and the list of missing DOIs for the library |
 | `index --out <folder>` | Rewrite `index.csv` in the PDF folder |
 | `verify --out <folder> [--out-dir reports]` | Check every downloaded PDF against its title and DOI (`verify.csv`) |
-| `mark-incomplete --out <folder> [--dry-run]` | Keep notice / first-page-only PDFs as `… [notice].pdf` and mark their papers `incomplete` for Phase B |
+| `mark-incomplete --out <folder> [--dry-run]` | Keep notice / first-page-only PDFs as `<ID> [notice] - <title>.pdf` and mark their papers `incomplete` for Phase B |
 | `rename --out <folder> [--dry-run]` | Rename existing PDFs after a change of the naming scheme |
 
 ## 3. Getting access to the paywalled papers
@@ -191,7 +191,7 @@ rclone copy /data/retracted_pdfs cloud:RetractedPapers --progress   # repeat aft
   - `done`: the PDF was saved
   - `not_found`: no source had a PDF link
   - `failed`: a link existed but the download failed, or an index lookup failed (the reason is in the `error` column)
-  - `incomplete`: the only PDF we have is a retraction notice or the first page (kept as `… [notice].pdf` / `… [first page].pdf`, see `mark-incomplete`)
+  - `incomplete`: the only PDF we have is a retraction notice or the first page (kept as `<ID> [notice] - <title>.pdf` / `<ID> [first page] - <title>.pdf`, see `mark-incomplete`)
 
 ## 6. Tests
 

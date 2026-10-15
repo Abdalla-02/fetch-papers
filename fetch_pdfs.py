@@ -684,13 +684,19 @@ REASONS = ["closed access (no open-access copy)", "blocked by bot protection (Cl
            "PDF is only a retraction notice or first page"]
 # 'verify' verdicts meaning the downloaded PDF is not the full article
 INCOMPLETE_VERDICTS = ("notice", "short")
-# 'mark-incomplete' keeps such a file under a marked name, e.g. '... [notice].pdf'
+# 'mark-incomplete' keeps such a file under a marked name, e.g. '001454 [notice] - Title.pdf'
 MARK_LABELS = {"notice": "notice", "short": "first page"}
 
 
 def marked_name(filename: str, verdict: str | None) -> str:
-    """File name (without .pdf) under which an incomplete PDF is kept."""
-    return f"{filename} [{MARK_LABELS[verdict]}]" if verdict in MARK_LABELS else filename
+    """File name (without .pdf) under which an incomplete PDF is kept: the status goes right
+    after the RW ID, e.g. '001001-002000/001454 - Title' -> '001001-002000/001454 [notice] - Title'."""
+    if verdict not in MARK_LABELS:
+        return filename
+    folder, slash, name = filename.rpartition("/")
+    rid, sep, title = name.partition(" - ")
+    marked = f"{rid} [{MARK_LABELS[verdict]}]{sep}{title}" if sep else f"{name} [{MARK_LABELS[verdict]}]"
+    return f"{folder}{slash}{marked}"
 # failures that may go away by themselves - retried with --retry-temporary
 TEMPORARY_REASONS = {REASONS[4], REASONS[7], REASONS[8]}
 
@@ -924,7 +930,7 @@ def cmd_verify(args):
 
 def cmd_mark_incomplete(args):
     """Keep PDFs that 'verify' found to be only a notice / first page under a marked name
-    ('... [notice].pdf', '... [first page].pdf') and set their papers to status 'incomplete',
+    ('<RW ID> [notice] - <title>.pdf', '<RW ID> [first page] - <title>.pdf') and set their papers to status 'incomplete',
     so a later run with --retry-incomplete can fetch the real article. Never deletes anything."""
     con = open_db(args.db)
     out = Path(args.out)
@@ -940,7 +946,7 @@ def cmd_mark_incomplete(args):
         counts[p[3]] += 1
     print(f"{len(plan)} PDFs to mark: " + ", ".join(f"{n} as [{MARK_LABELS[v]}]" for v, n in counts.items()))
     for _, src, dst, _ in plan[:5]:
-        print(f"  ...{src.name[-60:]}\n   -> ...{dst.name[-60:]}")
+        print(f"  {src.parent.name}/{src.name[:70]}\n   -> {dst.parent.name}/{dst.name[:70]}")
     if plan:
         print(f"  longest new path: {max(len(str(p[2])) for p in plan)} characters")
     if missing or clash:
@@ -1001,9 +1007,9 @@ def cmd_rename(args):
     new_names = [p[2].lower() for p in plan]
     if len(set(new_names)) != len(new_names):
         sys.exit("new file names are not unique - aborting, nothing changed")
-    files = [(doi, old + sfx, new + sfx) for doi, old, new, st in changes
-             for sfx in [""] + [f" [{label}]" for label in MARK_LABELS.values()]  # incl. marked notices
-             if (out / f"{old}{sfx}.pdf").exists()]
+    files = [(doi, marked_name(old, v), marked_name(new, v)) for doi, old, new, st in changes
+             for v in [None] + list(MARK_LABELS)  # the PDF itself and any marked notice / first page
+             if (out / f"{marked_name(old, v)}.pdf").exists()]
     print(f"{len(changes)} of {len(plan)} names change; {len(files)} PDFs on disk to rename")
     for _, old, new in files[:10]:
         print(f"  {old[:60]}.pdf\n   -> {new[:70]}.pdf")
@@ -1111,7 +1117,7 @@ def main():
     m.add_argument("--top", type=int, default=20)
     m.set_defaults(func=cmd_summary)
 
-    k = sub.add_parser("mark-incomplete", help="keep notice / first-page-only PDFs as '... [notice].pdf' and "
+    k = sub.add_parser("mark-incomplete", help="keep notice / first-page-only PDFs as '<ID> [notice] - <title>.pdf' and "
                                                "mark their papers for a new try (never deletes)")
     k.add_argument("--out", required=True, help="the PDF folder")
     k.add_argument("--dry-run", action="store_true", help="only show what would change")
