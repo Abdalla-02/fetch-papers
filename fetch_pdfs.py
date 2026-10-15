@@ -344,7 +344,8 @@ class Fetcher:
                         # one of our index/TDM APIs (probably a quota): skipping it would mark every
                         # remaining paper as failed without a real lookup, so stop the run instead
                         await resp.aclose()
-                        raise StopRun(f"{urlparse(final).hostname}: {reason}")
+                        raise StopRun(f"{urlparse(final).hostname}: {reason} - probably a rate limit or "
+                                      f"quota; run the same command again later")
                     # a publisher/repository site, e.g. "503, Retry-After: 3600": waiting would stall
                     # every paper on it, so leave it alone for this run (papers stay 'failed', retryable)
                     self.limiter.block(final, reason)
@@ -355,10 +356,12 @@ class Fetcher:
             host = urlparse(final).hostname or ""
             if host in API_HOSTS and resp.status_code == 401:
                 await resp.aclose()
-                raise StopRun(f"{host}: HTTP 401 - the API key was rejected, check the keys in .env")
+                raise StopRun(f"{host}: HTTP 401 - the API key was rejected; check the key in .env, "
+                              f"then run the same command again")
             if host in API_HOSTS and resp.status_code == 429:  # still limited after all retries: quota
                 await resp.aclose()
-                raise StopRun(f"{host}: HTTP 429 after {tries} tries - rate limit or quota used up")
+                raise StopRun(f"{host}: HTTP 429 after {tries} tries - rate limit or quota used up; "
+                              f"run the same command again later")
             if resp.status_code < 400:
                 self.limiter.ok(final)
             return resp
@@ -550,7 +553,7 @@ class Fetcher:
             rows = [r for r in rows if r[2] != "failed" or classify(r[2], r[3]) in TEMPORARY_REASONS]
         todo = [(doi, fn, status) for doi, fn, status, _ in rows if self.can_handle(doi)]
         if len(todo) < len(rows):
-            print(f"{len(rows) - len(todo)} papers left untouched: none of the sources "
+            print(f"{len(rows) - len(todo)} paper(s) left untouched: none of the sources "
                   f"({', '.join(self.sources)}) can handle them with the keys that are set")
         if self.a.limit:
             random.seed(0)
@@ -602,8 +605,8 @@ class Fetcher:
         for host, reason in self.limiter.blocked.items():
             print(f"blocked host (skipped for the rest of the run): {host} - {reason}")
         if self.stop_reason:
-            print(f"STOPPED EARLY after {done} of {total} DOIs - {self.stop_reason}. This is probably a rate "
-                  f"limit or quota; the remaining papers are untouched, run the same command again later.",
+            print(f"STOPPED EARLY after {done} of {total} DOIs - {self.stop_reason}. "
+                  f"The remaining papers are untouched.",
                   flush=True)
 
 
