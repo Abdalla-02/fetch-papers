@@ -76,15 +76,31 @@ This reads the first pages of every PDF and writes `reports/verify.csv` with one
 
 The note column also flags PDFs with more than 60 pages (probably a whole issue or supplement).
 
-**Phase B: publisher TDM APIs** (once you have the keys, see section 3):
+**Phase B: publisher TDM APIs** (once you have the keys, see section 3).
 
-```bash
-export ELSEVIER_API_KEY=...        # https://dev.elsevier.com
-export ELSEVIER_INSTTOKEN=...      # from your library, or run from the uni network
-export WILEY_TDM_TOKEN=...         # https://onlinelibrary.wiley.com/library-info/resources/text-and-datamining
-python fetch_pdfs.py run --email you@uni.de --out /data/retracted_pdfs \
-    --sources elsevier,wiley --retry-not-found --retry-failed
-```
+1. **Keys in `.env`.** Copy [`.env.example`](.env.example) to `.env` in the folder you run the script from (or next to `fetch_pdfs.py`) and fill in the keys. The script reads them at start and only prints whether each key is set, never the key itself. `.env` is in `.gitignore`: never commit it, never share it. Real environment variables take precedence over `.env`.
+2. **Mark the notice-only PDFs** (once, after `verify`), so Phase B fetches the real articles for them:
+   ```bash
+   python fetch_pdfs.py mark-incomplete --out /data/retracted_pdfs --dry-run   # shows what would change
+   python fetch_pdfs.py mark-incomplete --out /data/retracted_pdfs
+   ```
+   Each such PDF is kept, renamed to `… [notice].pdf` or `… [first page].pdf`, and its paper gets status `incomplete`. Nothing is deleted.
+3. **Small test first** (20 papers per publisher), then look at the log and the new PDFs:
+   ```bash
+   python fetch_pdfs.py run --email you@uni.de --out /data/retracted_pdfs --sources elsevier,wiley \
+       --retry-not-found --retry-failed --retry-incomplete --prefix 10.1016 --limit 20
+   # the same again with --prefix 10.1002, then:
+   python fetch_pdfs.py verify --out /data/retracted_pdfs
+   ```
+   Elsevier may send only the first page of the PDF if there is no entitlement for an article; `verify` shows these as `short`.
+4. **Full run:** the same command without `--prefix` and `--limit`. On Windows, use [`windows/run_phase_b.cmd`](windows/run_phase_b.cmd) (`TEST=1` for step 3, `TEST=0` for the full run).
+
+Good to know:
+
+- Only papers that the configured APIs can handle are touched (Elsevier: DOIs `10.1016/…`; Wiley: the prefixes in `--wiley-prefixes`, default `10.1002,10.1111`). All other papers keep their status and the reason from earlier runs.
+- **Hindawi (`10.1155`) via Wiley:** add it with `--wiley-prefixes 10.1002,10.1111,10.1155` once a small test shows that the Wiley API delivers Hindawi papers.
+- If an API rejects the key (HTTP 401) or keeps answering 429 (rate limit or quota used up), the run stops with `STOPPED EARLY` and exit code 3, without marking any paper as failed. Fix the key or wait, then run the same command again.
+- Papers with status `incomplete` keep it (and their notice file) if the APIs find nothing; if the real article is downloaded, it is saved under the normal name next to the notice file.
 
 **Phase C: Crossref full-text links.** Only run this if your library agrees, and only from a computer on the university network or VPN, so the publisher recognises your subscription:
 
@@ -117,6 +133,7 @@ python fetch_pdfs.py report                             # counts per status and 
 | `summary --out-dir reports --email …` | Per-publisher summary and the list of missing DOIs for the library |
 | `index --out <folder>` | Rewrite `index.csv` in the PDF folder |
 | `verify --out <folder> [--out-dir reports]` | Check every downloaded PDF against its title and DOI (`verify.csv`) |
+| `mark-incomplete --out <folder> [--dry-run]` | Keep notice / first-page-only PDFs as `… [notice].pdf` and mark their papers `incomplete` for Phase B |
 | `rename --out <folder> [--dry-run]` | Rename existing PDFs after a change of the naming scheme |
 
 ## 3. Getting access to the paywalled papers
@@ -174,6 +191,7 @@ rclone copy /data/retracted_pdfs cloud:RetractedPapers --progress   # repeat aft
   - `done`: the PDF was saved
   - `not_found`: no source had a PDF link
   - `failed`: a link existed but the download failed, or an index lookup failed (the reason is in the `error` column)
+  - `incomplete`: the only PDF we have is a retraction notice or the first page (kept as `… [notice].pdf` / `… [first page].pdf`, see `mark-incomplete`)
 
 ## 6. Tests
 
@@ -181,4 +199,4 @@ rclone copy /data/retracted_pdfs cloud:RetractedPapers --progress   # repeat aft
 python tests/test_fetch_pdfs.py
 ```
 
-The tests run offline against a small local web server that plays Unpaywall and some publisher sites. They check the file naming, the classification of failures, that a Cloudflare-blocked site gets exactly 8 requests and is then skipped, that API keys are not forwarded across redirects, that PDFs land in their ID-block folder, both kinds of long `Retry-After` (site skipped / run stopped), and the `verify` verdicts on small generated PDFs. Run them after every change to the script.
+The tests run offline against a small local web server that plays Unpaywall and some publisher sites. They check the file naming, the classification of failures, that a Cloudflare-blocked site gets exactly 8 requests and is then skipped, that API keys are not forwarded across redirects, that PDFs land in their ID-block folder, both kinds of long `Retry-After` (site skipped / run stopped), reading `.env`, Elsevier and Wiley downloads through fake APIs (Hindawi only when switched on), that a rejected key or a used-up quota stops the run without marking papers as failed, that papers no source can handle stay untouched, `mark-incomplete` with a later `--retry-incomplete`, and the `verify` verdicts on small generated PDFs. Run them after every change to the script.

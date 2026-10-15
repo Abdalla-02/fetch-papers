@@ -66,6 +66,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(503, b"busy", [("Retry-After", "3600")])
         if kind == "good":
             return self.send(200, PDF_BYTES, [("Content-Type", "application/pdf")])
+        if kind == "els":                       # fake Elsevier Article Retrieval API
+            key = self.headers.get("X-ELS-APIKey")
+            if key == "good":
+                return self.send(200, PDF_BYTES, [("Content-Type", "application/pdf")])
+            if key == "quota":
+                return self.send(429, b"quota exceeded")
+            return self.send(401, b"invalid api key")
+        if kind == "wiley":                     # fake Wiley TDM API
+            if self.headers.get("Wiley-TDM-Client-Token") == "good":
+                return self.send(200, PDF_BYTES, [("Content-Type", "application/pdf")])
+            return self.send(403, b"not entitled")
         self.send(404)
 
 
@@ -73,6 +84,10 @@ SERVER = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 PORT = SERVER.server_address[1]
 threading.Thread(target=SERVER.serve_forever, daemon=True).start()
 os.environ["UNPAYWALL_BASE"] = f"http://localhost:{PORT}/upw"
+os.environ["ELSEVIER_BASE"] = f"http://localhost:{PORT}/els"
+os.environ["WILEY_BASE"] = f"http://localhost:{PORT}/wiley"
+for _k in ("ELSEVIER_API_KEY", "ELSEVIER_INSTTOKEN", "WILEY_TDM_TOKEN"):   # never use real keys in tests
+    os.environ.pop(_k, None)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fetch_pdfs as F  # noqa: E402
@@ -90,11 +105,13 @@ def make_db(name, dois):
     return con
 
 
-def run_fetcher(con, name, concurrency=4):
-    args = types.SimpleNamespace(out=str(TMP / name), sources="unpaywall", email="test@example.org",
-                                 verbose=False, retry_failed=False, retry_temporary=False,
-                                 retry_not_found=False, prefix=None, limit=None,
-                                 concurrency=concurrency, progress_every=1000)
+def run_fetcher(con, name, concurrency=4, **overrides):
+    opts = dict(out=str(TMP / name), sources="unpaywall", email="test@example.org", verbose=False,
+                retry_failed=False, retry_temporary=False, retry_not_found=False, retry_incomplete=False,
+                wiley_prefixes=F.WILEY_PREFIXES, prefix=None, limit=None, concurrency=concurrency,
+                progress_every=1000)
+    opts.update(overrides)
+    args = types.SimpleNamespace(**opts)
     fetcher = F.Fetcher(args, con)
     t = time.time()
     asyncio.run(fetcher.run())
@@ -170,6 +187,100 @@ def test_long_retry_after_on_an_api_stops_the_run():
     assert "asked to wait 3600" in fetcher.stop_reason
     st = Counter(s for (s,) in con.execute("SELECT status FROM papers"))
     assert st == {"done": 3, "pending": 17}, st                          # rest untouched, not 'failed'
+
+
+class env:
+    """Temporarily set environment variables (API keys) for one test."""
+    def __init__(self, **kv):
+        self.kv = kv
+    def __enter__(self):
+        self.old = {k: os.environ.get(k) for k in self.kv}
+        os.environ.update(self.kv)
+    def __exit__(self, *exc):
+        for k, v in self.old.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+def test_load_env_file():
+    p = TMP / "test.env"
+    p.write_text('# comment\nexport ELSEVIER_API_KEY="abc123"\nWILEY_TDM_TOKEN = \'tok\'\nEMPTY=\nPRESET=from_file\n',
+                 encoding="utf-8")
+    with env(PRESET="from_shell"):
+        try:
+            names = F.load_env(str(p))
+            assert set(names) == {"ELSEVIER_API_KEY", "WILEY_TDM_TOKEN"}, names
+            assert os.environ["ELSEVIER_API_KEY"] == "abc123" and os.environ["WILEY_TDM_TOKEN"] == "tok"
+            assert os.environ["PRESET"] == "from_shell"                  # existing variables win
+        finally:
+            os.environ.pop("ELSEVIER_API_KEY", None)
+            os.environ.pop("WILEY_TDM_TOKEN", None)
+
+
+def test_wiley_prefixes_and_elsevier_download():
+    dois = ["10.1016/els-1", "10.1155/hin-1", "10.1002/wil-1"]
+    with env(ELSEVIER_API_KEY="good", WILEY_TDM_TOKEN="good"):
+        con = make_db("tdm_default", dois)
+        run_fetcher(con, "tdm_default", sources="elsevier,wiley")
+        st = dict(con.execute("SELECT doi, status FROM papers"))
+        # Hindawi is not sent to Wiley by default, so it is left untouched
+        assert st == {"10.1016/els-1": "done", "10.1155/hin-1": "pending", "10.1002/wil-1": "done"}, st
+        con = make_db("tdm_hindawi", dois)                                 # Hindawi only when switched on
+        run_fetcher(con, "tdm_hindawi", sources="elsevier,wiley", wiley_prefixes="10.1002,10.1111,10.1155")
+        st = dict(con.execute("SELECT doi, status FROM papers"))
+        assert st["10.1155/hin-1"] == "done", st
+
+
+def test_papers_no_source_can_handle_are_untouched():
+    con = make_db("untouched", ["10.1016/els-1", "10.1002/wil-1", "10.9999/x-1"])
+    con.execute("UPDATE papers SET status='failed', error='unpaywall: HTTP 403 (Cloudflare bot challenge) <u>'")
+    con.commit()
+    with env(WILEY_TDM_TOKEN="good"):                                   # no Elsevier key
+        run_fetcher(con, "untouched", sources="elsevier,wiley", retry_failed=True)
+    rows = {d: (s, e) for d, s, e in con.execute("SELECT doi, status, error FROM papers")}
+    assert rows["10.1002/wil-1"][0] == "done", rows
+    for doi in ("10.1016/els-1", "10.9999/x-1"):                         # kept exactly as they were
+        assert rows[doi] == ("failed", "unpaywall: HTTP 403 (Cloudflare bot challenge) <u>"), rows[doi]
+
+
+def test_rejected_key_or_quota_stops_the_run():
+    for key, expected in (("bad", "API key was rejected"), ("quota", "rate limit or quota")):
+        with env(ELSEVIER_API_KEY=key):
+            con = make_db(f"els_{key}", [f"10.1016/els-{n}" for n in range(10)])
+            fetcher, secs = run_fetcher(con, f"els_{key}", concurrency=1, sources="elsevier")
+        assert expected in fetcher.stop_reason, fetcher.stop_reason
+        st = Counter(s for (s,) in con.execute("SELECT status FROM papers"))
+        assert st == {"pending": 10}, st                                   # nothing marked as failed
+
+
+def test_mark_incomplete_and_retry():
+    out = TMP / "incomplete"
+    con = make_db("incomplete", ["10.1016/els-1", "10.9999/x-2", "10.9999/x-3"])
+    verdicts = {"10.1016/els-1": "notice", "10.9999/x-2": "short", "10.9999/x-3": "ok"}
+    for doi, fn in con.execute("SELECT doi, filename FROM papers").fetchall():
+        (out / fn).parent.mkdir(parents=True, exist_ok=True)
+        (out / f"{fn}.pdf").write_bytes(PDF_BYTES)
+        con.execute("UPDATE papers SET status='done', source='unpaywall' WHERE doi=?", (doi,))
+        con.execute("INSERT INTO checks VALUES (?,?,?,?,?)", (doi, verdicts[doi], "", 1, 0))
+    con.commit()
+    args = types.SimpleNamespace(db=str(TMP / "incomplete.sqlite"), out=str(out), dry_run=True)
+    F.cmd_mark_incomplete(args)                                            # dry run: nothing changes
+    assert Counter(s for (s,) in con.execute("SELECT status FROM papers")) == {"done": 3}
+    args.dry_run = False
+    F.cmd_mark_incomplete(args)
+    st = dict(con.execute("SELECT doi, status FROM papers"))
+    assert st == {"10.1016/els-1": "incomplete", "10.9999/x-2": "incomplete", "10.9999/x-3": "done"}, st
+    fn1 = con.execute("SELECT filename FROM papers WHERE doi='10.1016/els-1'").fetchone()[0]
+    assert (out / f"{fn1} [notice].pdf").exists() and not (out / f"{fn1}.pdf").exists()
+    index = (out / "index.csv").read_text(encoding="utf-8-sig")
+    assert "[notice].pdf" in index and "[first page].pdf" in index
+    # a later Phase B run fetches the real article for the Elsevier paper; the other stays 'incomplete'
+    with env(ELSEVIER_API_KEY="good"):
+        run_fetcher(con, "incomplete", sources="elsevier", retry_incomplete=True)
+    st = dict(con.execute("SELECT doi, status FROM papers"))
+    assert st == {"10.1016/els-1": "done", "10.9999/x-2": "incomplete", "10.9999/x-3": "done"}, st
+    assert (out / f"{fn1}.pdf").exists() and (out / f"{fn1} [notice].pdf").exists()   # notice is kept
+    assert con.execute("SELECT source FROM papers WHERE doi='10.9999/x-2'").fetchone()[0] == "unpaywall"
+    assert con.execute("SELECT COUNT(*) FROM checks WHERE doi='10.1016/els-1'").fetchone()[0] == 0  # re-check
 
 
 def _pdf(page_texts):

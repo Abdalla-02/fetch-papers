@@ -19,6 +19,8 @@ Usage:
   python fetch_pdfs.py run     ... --retry-temporary              (retry timeouts / server errors)
   python fetch_pdfs.py verify  --out /data/retracted_pdfs        (check PDFs, writes reports/verify.csv)
   python fetch_pdfs.py summary --out-dir reports --email you@uni.de   (lists for the library)
+  python fetch_pdfs.py mark-incomplete --out /data/retracted_pdfs [--dry-run]
+  python fetch_pdfs.py run     ... --sources elsevier,wiley --retry-incomplete   (Phase B, keys in .env)
   python fetch_pdfs.py index   --out /data/retracted_pdfs        (writes index.csv)
   python fetch_pdfs.py rename  --out /data/retracted_pdfs [--dry-run]
 
@@ -54,6 +56,7 @@ WILEY = os.environ.get("WILEY_BASE", "https://api.wiley.com")
 CROSSREF = os.environ.get("CROSSREF_BASE", "https://api.crossref.org")
 
 ALL_SOURCES = ["unpaywall", "openalex", "elsevier", "wiley", "crossref"]
+WILEY_PREFIXES = "10.1002,10.1111"   # default DOI prefixes for the Wiley TDM API (--wiley-prefixes)
 # the index/TDM APIs themselves (as opposed to publisher and repository sites)
 API_HOSTS = {urlparse(base).hostname for base in (UNPAYWALL, OPENALEX, ELSEVIER, WILEY, CROSSREF)}
 
@@ -148,7 +151,7 @@ CREATE TABLE IF NOT EXISTS papers (
     record_ids TEXT,              -- Retraction Watch IDs sharing this DOI
     title      TEXT,
     filename   TEXT UNIQUE,
-    status     TEXT DEFAULT 'pending',   -- pending | done | not_found | failed
+    status     TEXT DEFAULT 'pending',   -- pending | done | not_found | failed | incomplete
     source     TEXT,
     pdf_url    TEXT,
     error      TEXT,
@@ -292,6 +295,9 @@ class Fetcher:
         self.els_key = os.environ.get("ELSEVIER_API_KEY")
         self.els_inst = os.environ.get("ELSEVIER_INSTTOKEN")
         self.wiley_tok = os.environ.get("WILEY_TDM_TOKEN")
+        # DOI prefixes sent to the Wiley TDM API; add 10.1155 (Hindawi) once it is confirmed to work
+        self.wiley_prefixes = tuple(p.strip().rstrip("/") + "/" for p in
+                                    getattr(args, "wiley_prefixes", WILEY_PREFIXES).split(",") if p.strip())
         self.ua = f"RetractedPapersResearch/1.0 (mailto:{args.email})"
         self.stats = defaultdict(int)
         self.t0 = time.time()
@@ -346,6 +352,13 @@ class Fetcher:
                 self.limiter.slow_down(final, wait)
                 await resp.aclose()
                 continue  # the limiter now holds this host back for `wait` seconds
+            host = urlparse(final).hostname or ""
+            if host in API_HOSTS and resp.status_code == 401:
+                await resp.aclose()
+                raise StopRun(f"{host}: HTTP 401 - the API key was rejected, check the keys in .env")
+            if host in API_HOSTS and resp.status_code == 429:  # still limited after all retries: quota
+                await resp.aclose()
+                raise StopRun(f"{host}: HTTP 429 after {tries} tries - rate limit or quota used up")
             if resp.status_code < 400:
                 self.limiter.ok(final)
             return resp
@@ -391,7 +404,7 @@ class Fetcher:
                     if self.els_inst:
                         h["X-ELS-Insttoken"] = self.els_inst
                     yield "elsevier", f"{ELSEVIER}/content/article/doi/{doi}?httpAccept=application/pdf", h
-                elif src == "wiley" and self.wiley_tok and doi.startswith(("10.1002/", "10.1111/")):
+                elif src == "wiley" and self.wiley_tok and doi.startswith(self.wiley_prefixes):
                     yield "wiley", f"{WILEY}/onlinelibrary/tdm/v1/articles/{q}", {"Wiley-TDM-Client-Token": self.wiley_tok}
                 elif src == "crossref":
                     j = await self.get_json(client, f"{CROSSREF}/works/{q}?mailto={quote(self.a.email)}")
@@ -451,7 +464,7 @@ class Fetcher:
             if tmp.exists():
                 tmp.unlink()
 
-    async def process(self, client, doi, filename):
+    async def process(self, client, doi, filename, old_status="pending"):
         dest = self.out / f"{filename}.pdf"
         if dest.exists() and dest.stat().st_size > 1000:
             self.save(doi, "done", "already_on_disk", None, None)
@@ -473,7 +486,12 @@ class Fetcher:
                 return
             errors.append(f"{src}: {err} <{url[:120]}>")
         errors += lookup_errors
-        if not tried and not lookup_errors:
+        if old_status == "incomplete":
+            # we still have the notice / first page: keep that status, just note why this try failed
+            self.save(doi, "incomplete", None, None,
+                      (" | ".join(errors) or "no PDF link found in any source")[:2000])
+            self.stats["still_incomplete"] += 1
+        elif not tried and not lookup_errors:
             self.save(doi, "not_found", None, None, "no PDF link found in any source")
             self.stats["not_found"] += 1
         else:
@@ -482,6 +500,11 @@ class Fetcher:
             self.stats["failed"] += 1
 
     def save(self, doi, status, source, url, error):
+        if status == "incomplete":  # keep source/pdf_url of the notice we already have
+            self.con.execute("UPDATE papers SET error=?, attempts=attempts+1, updated=? WHERE doi=?",
+                             (error, time.time(), doi))
+            self.con.commit()
+            return
         self.con.execute(
             "UPDATE papers SET status=?, source=?, pdf_url=?, error=?, attempts=attempts+1, updated=? WHERE doi=?",
             (status, source, url, error, time.time(), doi),
@@ -498,11 +521,25 @@ class Fetcher:
         print(f"[{n_done}/{n_total}] ok={ok} not_found={self.stats['not_found']} "
               f"failed={self.stats['failed']}  {rate*60:.0f}/min  ETA {eta:.1f} h", flush=True)
 
+    def can_handle(self, doi: str) -> bool:
+        """Could any selected source give a PDF for this DOI? Papers that no source can handle
+        (e.g. Phase B without a key, or a non-Elsevier DOI with --sources elsevier) are not touched,
+        so their status and the reason from earlier runs are kept."""
+        for src in self.sources:
+            if src in ("unpaywall", "openalex", "crossref"):
+                return True
+            if src == "elsevier" and self.els_key and doi.startswith("10.1016/"):
+                return True
+            if src == "wiley" and self.wiley_tok and doi.startswith(self.wiley_prefixes):
+                return True
+        return False
+
     async def run(self):
         retry_failed = self.a.retry_failed or self.a.retry_temporary
         statuses = ["pending"] + (["failed"] if retry_failed else []) \
-                   + (["not_found"] if self.a.retry_not_found else [])
-        sql = f"SELECT doi, filename, status, error FROM papers WHERE status IN ({','.join('?'*len(statuses))})"
+                   + (["not_found"] if self.a.retry_not_found else []) \
+                   + (["incomplete"] if getattr(self.a, "retry_incomplete", False) else [])
+        sql =f"SELECT doi, filename, status, error FROM papers WHERE status IN ({','.join('?'*len(statuses))})"
         params = list(statuses)
         if self.a.prefix:
             sql += " AND doi LIKE ?"
@@ -511,15 +548,18 @@ class Fetcher:
         if self.a.retry_temporary and not self.a.retry_failed:
             # only failures that may go away by themselves (timeouts, 5xx ...), not blocked sites
             rows = [r for r in rows if r[2] != "failed" or classify(r[2], r[3]) in TEMPORARY_REASONS]
-        todo = [(doi, fn) for doi, fn, _, _ in rows]
+        todo = [(doi, fn, status) for doi, fn, status, _ in rows if self.can_handle(doi)]
+        if len(todo) < len(rows):
+            print(f"{len(rows) - len(todo)} papers left untouched: none of the sources "
+                  f"({', '.join(self.sources)}) can handle them with the keys that are set")
         if self.a.limit:
             random.seed(0)
             random.shuffle(todo)
             todo = todo[: self.a.limit]
         # interleave publishers so per-host rate limits don't serialize the queue
         groups = defaultdict(list)
-        for d, fn in todo:
-            groups[d.split("/")[0]].append((d, fn))
+        for item in todo:
+            groups[item[0].split("/")[0]].append(item)
         queue: asyncio.Queue = asyncio.Queue()
         while any(groups.values()):
             for k in list(groups):
@@ -527,6 +567,15 @@ class Fetcher:
                     queue.put_nowait(groups[k].pop())
         total = queue.qsize()
         print(f"{total} DOIs to process with sources: {', '.join(self.sources)}")
+        keys = {"elsevier": [("ELSEVIER_API_KEY", self.els_key), ("ELSEVIER_INSTTOKEN", self.els_inst)],
+                "wiley": [("WILEY_TDM_TOKEN", self.wiley_tok)]}
+        for src in self.sources:
+            for name, value in keys.get(src, []):   # never print the keys themselves
+                print(f"  {name}: {'set' if value else 'NOT SET'}")
+            if src == "elsevier" and not self.els_key or src == "wiley" and not self.wiley_tok:
+                print(f"  ! source '{src}' is skipped: its key is missing (put it in .env)")
+            if src == "wiley" and self.wiley_tok:
+                print(f"  Wiley TDM API is used for DOI prefixes: {', '.join(p.rstrip('/') for p in self.wiley_prefixes)}")
         done = 0
 
         limits = httpx.Limits(max_connections=self.a.concurrency * 2, max_keepalive_connections=self.a.concurrency)
@@ -536,11 +585,11 @@ class Fetcher:
                 nonlocal done
                 while not self.stop_reason:
                     try:
-                        doi, fn = queue.get_nowait()
+                        doi, fn, old_status = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         return
                     try:
-                        await self.process(client, doi, fn)
+                        await self.process(client, doi, fn, old_status)
                     except StopRun as e:  # this paper is not saved, so it keeps its old status
                         self.stop_reason = self.stop_reason or str(e)
                         return
@@ -588,8 +637,10 @@ def write_index(con, out: Path):
     for doi, ids, title, fn, status, check, source, url, err in con.execute(
             "SELECT p.doi, record_ids, title, filename, status, c.verdict, source, pdf_url, error "
             "FROM papers p LEFT JOIN checks c ON c.doi = p.doi"):
+        if status == "incomplete":  # the file on disk is the marked notice / first page
+            fn = marked_name(fn, check)
         folder, _, name = fn.rpartition("/")
-        done = status == "done"
+        done = status in ("done", "incomplete")
         rows.append([first_id(ids), ids, doi, doi.split("/")[0], title, folder if done else "",
                      f"{name}.pdf" if done else "", status, (check or "") if done else "",
                      source, url, (err or "")[:300]])
@@ -630,6 +681,13 @@ REASONS = ["closed access (no open-access copy)", "blocked by bot protection (Cl
            "PDF is only a retraction notice or first page"]
 # 'verify' verdicts meaning the downloaded PDF is not the full article
 INCOMPLETE_VERDICTS = ("notice", "short")
+# 'mark-incomplete' keeps such a file under a marked name, e.g. '... [notice].pdf'
+MARK_LABELS = {"notice": "notice", "short": "first page"}
+
+
+def marked_name(filename: str, verdict: str | None) -> str:
+    """File name (without .pdf) under which an incomplete PDF is kept."""
+    return f"{filename} [{MARK_LABELS[verdict]}]" if verdict in MARK_LABELS else filename
 # failures that may go away by themselves - retried with --retry-temporary
 TEMPORARY_REASONS = {REASONS[4], REASONS[7], REASONS[8]}
 
@@ -693,7 +751,7 @@ def cmd_summary(args):
         if status == "done" and check not in INCOMPLETE_VERDICTS:
             per[p]["done"] += 1
             continue
-        if status == "done":  # downloaded, but 'verify' found only a notice / first page
+        if status in ("done", "incomplete"):  # we only have a notice / first page
             status, reason = "pdf_incomplete", REASONS[-1]
         else:
             reason = classify(status, err) if status != "pending" else "not processed yet"
@@ -849,9 +907,83 @@ def cmd_verify(args):
         print(f"  {v:<11} {counts[v]}")
     long_ = sum(1 for _, r in results if "whole issue" in r["note"])
     print(f"  (note: {long_} very long PDFs - whole issue or supplement?)")
+    # Windows/sync clients sometimes rename a file to its old 8.3 short name, e.g. '049929~1.PDF'
+    short_names = [p for p in out.rglob("*") if p.is_file() and re.search(r"~\d+\.pdf$", p.name, re.I)]
+    if short_names:
+        print(f"  ! {len(short_names)} file(s) with a Windows short name (renamed by the sync client?) - "
+              f"give them their real name again, see index.csv:")
+        for p in short_names[:20]:
+            print(f"    {p.relative_to(out)}")
     print(f"written: {rep / 'verify.csv'}")
     if not args.limit:
         write_index(con, out)  # adds the verdicts as column 'pdf_check'
+
+
+def cmd_mark_incomplete(args):
+    """Keep PDFs that 'verify' found to be only a notice / first page under a marked name
+    ('... [notice].pdf', '... [first page].pdf') and set their papers to status 'incomplete',
+    so a later run with --retry-incomplete can fetch the real article. Never deletes anything."""
+    con = open_db(args.db)
+    out = Path(args.out)
+    rows = con.execute("SELECT p.doi, p.filename, c.verdict FROM papers p JOIN checks c ON c.doi = p.doi "
+                       f"WHERE p.status='done' AND c.verdict IN ({','.join('?' * len(MARK_LABELS))})",
+                       list(MARK_LABELS)).fetchall()
+    plan = [(doi, out / f"{fn}.pdf", out / f"{marked_name(fn, v)}.pdf", v) for doi, fn, v in rows]
+    missing = [p for p in plan if not p[1].exists()]
+    clash = [p for p in plan if p[2].exists()]
+    plan = [p for p in plan if p not in missing and p not in clash]
+    counts = defaultdict(int)
+    for p in plan:
+        counts[p[3]] += 1
+    print(f"{len(plan)} PDFs to mark: " + ", ".join(f"{n} as [{MARK_LABELS[v]}]" for v, n in counts.items()))
+    for _, src, dst, _ in plan[:5]:
+        print(f"  ...{src.name[-60:]}\n   -> ...{dst.name[-60:]}")
+    if plan:
+        print(f"  longest new path: {max(len(str(p[2])) for p in plan)} characters")
+    if missing or clash:
+        print(f"skipped: {len(missing)} files not found on disk, {len(clash)} marked file already exists "
+              f"(e.g. {(missing or clash)[0][1].name})")
+    if args.dry_run:
+        print("dry run - nothing changed")
+        return
+    done = []
+    try:
+        for doi, src, dst, _ in plan:
+            os.rename(src, dst)
+            done.append((src, dst))
+    except OSError as e:  # undo, so files and database stay consistent
+        for src, dst in reversed(done):
+            os.rename(dst, src)
+        sys.exit(f"rename failed ({e}) - undone, nothing changed")
+    with con:
+        con.executemany("UPDATE papers SET status='incomplete', updated=? WHERE doi=?",
+                        [(time.time(), doi) for doi, *_ in plan])
+    print(f"marked {len(done)} PDFs; their papers now have status 'incomplete' "
+          f"(fetch the real article later with: run ... --retry-incomplete)")
+    write_index(con, out)
+
+
+def load_env(path: str | None) -> list[str]:
+    """Read KEY=VALUE lines from a .env file into os.environ (existing variables win).
+    Returns the names that were set - the values are never printed."""
+    candidates = [Path(path)] if path else [Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"]
+    for p in candidates:
+        if p.is_file():
+            names = []
+            for line in p.read_text(encoding="utf-8-sig").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = (x.strip() for x in line.removeprefix("export ").split("=", 1))
+                value = value.strip('"').strip("'")
+                if key and value and key not in os.environ:
+                    os.environ[key] = value
+                    names.append(key)
+            print(f"loaded {len(names)} setting(s) from {p}: {', '.join(names) or '-'}", file=sys.stderr)
+            return names
+    if path:
+        sys.exit(f"--env file not found: {path}")
+    return []
 
 
 def cmd_rename(args):
@@ -866,7 +998,9 @@ def cmd_rename(args):
     new_names = [p[2].lower() for p in plan]
     if len(set(new_names)) != len(new_names):
         sys.exit("new file names are not unique - aborting, nothing changed")
-    files = [(doi, old, new) for doi, old, new, st in changes if (out / f"{old}.pdf").exists()]
+    files = [(doi, old + sfx, new + sfx) for doi, old, new, st in changes
+             for sfx in [""] + [f" [{label}]" for label in MARK_LABELS.values()]  # incl. marked notices
+             if (out / f"{old}{sfx}.pdf").exists()]
     print(f"{len(changes)} of {len(plan)} names change; {len(files)} PDFs on disk to rename")
     for _, old, new in files[:10]:
         print(f"  {old[:60]}.pdf\n   -> {new[:70]}.pdf")
@@ -922,6 +1056,7 @@ def cmd_report(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db", default="papers.sqlite", help="state database (default: papers.sqlite)")
+    p.add_argument("--env", help="file with API keys (default: .env in the current folder or next to the script)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     i = sub.add_parser("import", help="load the Retraction Watch CSV into the state DB")
@@ -942,6 +1077,11 @@ def main():
                    help="retry only failures that may be temporary (timeouts, network errors, HTTP 5xx), "
                         "not papers on sites that blocked us")
     r.add_argument("--retry-not-found", action="store_true")
+    r.add_argument("--retry-incomplete", action="store_true",
+                   help="try again for papers whose PDF is only a notice / first page (see mark-incomplete)")
+    r.add_argument("--wiley-prefixes", default=WILEY_PREFIXES,
+                   help=f"DOI prefixes sent to the Wiley TDM API (default: {WILEY_PREFIXES}; "
+                        "add 10.1155 for Hindawi once tested)")
     r.add_argument("--progress-every", type=int, default=50)
     r.add_argument("-v", "--verbose", action="store_true")
     r.set_defaults(func=cmd_run)
@@ -968,12 +1108,19 @@ def main():
     m.add_argument("--top", type=int, default=20)
     m.set_defaults(func=cmd_summary)
 
+    k = sub.add_parser("mark-incomplete", help="keep notice / first-page-only PDFs as '... [notice].pdf' and "
+                                               "mark their papers for a new try (never deletes)")
+    k.add_argument("--out", required=True, help="the PDF folder")
+    k.add_argument("--dry-run", action="store_true", help="only show what would change")
+    k.set_defaults(func=cmd_mark_incomplete)
+
     n = sub.add_parser("rename", help="rename/move existing PDFs to the current naming scheme (never deletes)")
     n.add_argument("--out", required=True, help="the PDF folder")
     n.add_argument("--dry-run", action="store_true", help="only show what would change")
     n.set_defaults(func=cmd_rename)
 
     args = p.parse_args()
+    load_env(args.env)   # API keys from .env - never hard-coded, never committed
     args.func(args)
 
 
