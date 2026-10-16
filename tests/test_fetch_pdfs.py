@@ -285,6 +285,37 @@ def test_mark_incomplete_and_retry():
     assert con.execute("SELECT COUNT(*) FROM checks WHERE doi='10.1016/els-1'").fetchone()[0] == 0  # re-check
 
 
+def test_folder_guard_stops_on_missing_pdfs():
+    """A sync folder that looks empty (e.g. Nextcloud virtual files without the client) must stop the commands."""
+    out = TMP / "guard"
+    con = make_db("guard", [f"10.9999/g-{n}" for n in range(30)])
+    fns = [fn for (fn,) in con.execute("SELECT filename FROM papers ORDER BY doi")]
+    for fn in fns:
+        (out / fn).parent.mkdir(parents=True, exist_ok=True)
+        (out / f"{fn}.pdf").write_bytes(PDF_BYTES)
+    con.execute("UPDATE papers SET status='done'")
+    # one paper is 'incomplete': its file is the marked notice - it must count as present
+    marked = F.marked_name(fns[0], "notice")
+    (out / f"{fns[0]}.pdf").rename(out / f"{marked}.pdf")
+    con.execute("UPDATE papers SET status='incomplete' WHERE filename=?", (fns[0],))
+    con.execute("INSERT INTO checks VALUES ((SELECT doi FROM papers WHERE filename=?),'notice','',1,0)", (fns[0],))
+    con.commit()
+    args = types.SimpleNamespace(db=str(TMP / "guard.sqlite"), out=str(out), dry_run=True, skip_folder_check=False)
+    F.check_pdf_folder(con, out, args)                                    # all 30 present: no complaint
+    for fn in fns[1:5]:                                                   # 26 of 30 left = 87% < 90%
+        (out / f"{fn}.pdf").unlink()
+    before = list(con.execute("SELECT doi, status, filename FROM papers ORDER BY doi"))
+    for cmd in (F.cmd_rename, F.cmd_mark_incomplete):
+        try:
+            cmd(args)
+            raise AssertionError(f"{cmd.__name__} did not stop")
+        except SystemExit as e:
+            assert "STOPPED: only 26 of 30" in str(e), e
+    assert list(con.execute("SELECT doi, status, filename FROM papers ORDER BY doi")) == before   # nothing changed
+    args.skip_folder_check = True                                         # explicit override works
+    F.check_pdf_folder(con, out, args)
+
+
 def _pdf(page_texts):
     """Minimal valid PDF with one text line per entry of each page."""
     objs = ["<< /Type /Catalog /Pages 2 0 R >>", None, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
