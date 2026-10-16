@@ -617,6 +617,7 @@ def cmd_run(args):
     if not con.execute("SELECT COUNT(*) FROM papers").fetchone()[0]:
         # a wrong --db path would otherwise create an empty DB and overwrite index.csv with nothing
         sys.exit(f"{os.path.abspath(args.db)} contains no papers - run 'import' first or check --db")
+    check_pdf_folder(con, Path(args.out), args)
     fetcher = Fetcher(args, con)
     try:
         asyncio.run(fetcher.run())
@@ -869,6 +870,32 @@ def verify_pdf(path: str, title: str, doi: str) -> dict:
     return r
 
 
+# ----------------------------------------------------------------------------- PDF folder guard
+FOLDER_CHECK_MIN = 20      # only check once at least this many PDFs are expected
+FOLDER_CHECK_SHARE = 0.9   # refuse to work if fewer than 90% of the expected PDFs are on disk
+
+
+def check_pdf_folder(con, out: Path, args):
+    """Refuse to work on a PDF folder that is (temporarily) missing most of its files.
+
+    A sync folder with 'virtual files' (Nextcloud, OneDrive) can look empty when its client is not
+    running. Then 'run' would download everything again, 'rename' would update the database for files
+    it cannot see, and 'verify' / 'mark-incomplete' would report nonsense. --skip-folder-check overrides."""
+    if getattr(args, "skip_folder_check", False):
+        return
+    expected = [marked_name(fn, v) if status == "incomplete" else fn for fn, status, v in con.execute(
+        "SELECT filename, status, c.verdict FROM papers p LEFT JOIN checks c ON c.doi = p.doi "
+        "WHERE p.status IN ('done', 'incomplete')")]
+    if len(expected) < FOLDER_CHECK_MIN:
+        return
+    present = sum(1 for fn in expected if (out / f"{fn}.pdf").exists())
+    if present < FOLDER_CHECK_SHARE * len(expected):
+        sys.exit(f"STOPPED: only {present} of {len(expected)} PDFs that the database expects are in {out}.\n"
+                 f"Is this the right --out folder? If it is a Nextcloud/OneDrive folder with 'virtual files', "
+                 f"start the sync client first - without it Windows cannot show the files.\n"
+                 f"Nothing was changed. If the folder really is meant to be empty or new, add --skip-folder-check.")
+
+
 def cmd_verify(args):
     """Check every downloaded PDF against its title and DOI; write <out-dir>/verify.csv."""
     import importlib.util
@@ -877,6 +904,7 @@ def cmd_verify(args):
     from concurrent.futures import ProcessPoolExecutor
     con = open_db(args.db)
     out, rep = Path(args.out), Path(args.out_dir)
+    check_pdf_folder(con, out, args)
     rep.mkdir(parents=True, exist_ok=True)
     papers = con.execute("SELECT doi, record_ids, title, filename FROM papers WHERE status='done'").fetchall()
     if args.limit:
@@ -934,6 +962,7 @@ def cmd_mark_incomplete(args):
     so a later run with --retry-incomplete can fetch the real article. Never deletes anything."""
     con = open_db(args.db)
     out = Path(args.out)
+    check_pdf_folder(con, out, args)
     rows = con.execute("SELECT p.doi, p.filename, c.verdict FROM papers p JOIN checks c ON c.doi = p.doi "
                        f"WHERE p.status='done' AND c.verdict IN ({','.join('?' * len(MARK_LABELS))})",
                        list(MARK_LABELS)).fetchall()
@@ -1000,6 +1029,7 @@ def cmd_rename(args):
     rename/move PDFs already downloaded. Never deletes anything; --dry-run only prints the plan."""
     con = open_db(args.db)
     out = Path(args.out)
+    check_pdf_folder(con, out, args)
     plan = [(doi, old, make_filename(ids, title), status)
             for doi, ids, title, old, status in
             con.execute("SELECT doi, record_ids, title, filename, status FROM papers")]
@@ -1066,6 +1096,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db", default="papers.sqlite", help="state database (default: papers.sqlite)")
     p.add_argument("--env", help="file with API keys (default: .env in the current folder or next to the script)")
+    p.add_argument("--skip-folder-check", action="store_true",
+                   help="work even if most PDFs the database expects are missing from --out (e.g. a new, empty folder)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     i = sub.add_parser("import", help="load the Retraction Watch CSV into the state DB")
