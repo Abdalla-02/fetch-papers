@@ -220,7 +220,8 @@ __marimo__/
 # fetch_pdfs.py data - never commit: only scripts and docs belong in git
 *.pdf
 *.pdf.part
-pdfs/
+pdfs/*
+!pdfs/README.md
 *.sqlite
 *.sqlite-*
 *.sqlite3

@@ -1,6 +1,6 @@
 # Retracted-papers PDF download: analysis report
 
-*Status: 9 October 2026 (week 2). Phase A (open access) and a retry of temporary failures are complete, and every PDF has been checked. Phase B (publisher TDM APIs) is waiting for API tokens from the library.*
+*Status: 22 October 2026 (week 3). Phase A (open access) and a retry of temporary failures are complete, and every PDF has been checked. Phase B (publisher TDM APIs) is prepared; the API keys are being requested directly from the publishers (Elsevier, Wiley).*
 
 ## 1. Summary
 
@@ -9,7 +9,7 @@
 - **Quality check (week 2): 1,146 of these PDFs are only the retraction notice or the article's first page**, not the article. So **6,031 papers (9.5%) have a full-text PDF**; 57,759 are still missing (see section 5).
 - Of the 57,759 missing papers, **35,367 (61%) have no open-access copy at all**, **19,836 (34%) have an open-access link, but the publisher's site refused the download**, mostly through Cloudflare or similar bot protection, and 1,146 (2%) have only a notice / first page as PDF.
 - The biggest single group, **Hindawi (11,757 missing, 20% of all missing papers)**, is open access (CC-BY), but its download server is behind a Cloudflare bot check. Hindawi is now part of Wiley, so the Wiley TDM API may provide these papers; this will be tested as soon as a token is available.
-- Most of the remaining papers can only be obtained legally through the publishers' text-and-data-mining (TDM) APIs. That needs tokens arranged through the university library. The per-publisher list for the library is in `reports/missing_by_publisher.csv`.
+- Most of the remaining papers can only be obtained legally through the publishers' text-and-data-mining (TDM) APIs. The API keys are requested directly from the publishers first; the university library is asked only for what they don't cover. The per-publisher list of missing papers is in `reports/missing_by_publisher.csv`.
 
 ## 2. Input data
 
@@ -26,9 +26,9 @@ Largest publishers (by DOI prefix):
 | Prefix | Publisher | DOIs | Legal route |
 |---|---|---|---|
 | 10.1155 | Hindawi (Wiley) | 11,801 | Open access, but download server blocks bots → Wiley TDM API |
-| 10.1016 | Elsevier | 8,169 | Elsevier Article Retrieval API (API key + institutional token) |
+| 10.1016 | Elsevier | 8,169 | Elsevier Article Retrieval API (API key, from the university network) |
 | 10.1109 | IEEE | 7,797 | No public TDM PDF API → library arrangement |
-| 10.1007 | Springer | 6,717 | Partly open access; the rest via library / Springer Nature TDM |
+| 10.1007 | Springer | 6,717 | Partly open access; the rest via Springer Nature TDM or the library |
 | 10.1002 | Wiley | 2,352 | Wiley TDM API |
 | 10.3233 | IOS Press | 1,730 | Library |
 | 10.1371 | PLOS | 1,682 | Open access, downloads work |
@@ -127,9 +127,9 @@ The PDFs and `index.csv` are in the shared Nextcloud folder (`Retracted_Papers`)
 | Prefix | Publisher | Missing | of | Legal route |
 |---|---|---|---|---|
 | 10.1155 | Hindawi | 11,749 | 11,801 | Wiley TDM API |
-| 10.1016 | Elsevier | 8,071 | 8,169 | Elsevier API (key + institutional token) |
+| 10.1016 | Elsevier | 8,071 | 8,169 | Elsevier API key (from the university network) |
 | 10.1109 | IEEE | 7,770 | 7,797 | Library arrangement |
-| 10.1007 | Springer | 5,528 | 6,717 | Springer Nature TDM via library |
+| 10.1007 | Springer | 5,528 | 6,717 | Springer Nature TDM or library |
 | 10.1002 | Wiley | 2,327 | 2,352 | Wiley TDM API |
 | 10.3233 | IOS Press | 1,725 | 1,730 | Library |
 | 10.1080 | Taylor & Francis (Informa) | 1,523 | 1,529 | Library |
@@ -201,19 +201,22 @@ Things that were deliberately **not** done: no browser automation (e.g. Puppetee
 |---|---|---|---|
 | A | Unpaywall + OpenAlex (open access) | **done: 7,005 PDFs (11%)** | – |
 | A (retry) | same, `--retry-temporary` | **done: 172 more PDFs** (7,177 in total; 1,146 of them only a notice / first page) | – |
-| B | Wiley TDM (incl. Hindawi, if Wiley serves 10.1155) | up to ~15,400 | Wiley TDM token |
-| B | Elsevier API | up to ~8,000 | Elsevier API key + institutional token |
+| B | Wiley TDM (incl. Hindawi, if Wiley serves 10.1155) | up to ~15,400 | Wiley TDM token (requested directly from Wiley) |
+| B | Elsevier API | up to ~8,000 | Elsevier API key (dev.elsevier.com), used from the university network |
 | C | Crossref full-text links | depends on licences | library approval, university network |
-| – | IEEE, Springer Nature, T&F, SAGE, IOS Press … | – | library arrangement |
+| – | IEEE, Springer Nature, T&F, SAGE, IOS Press … | – | publisher APIs where available, otherwise library |
+| end | Papers that still failed | – | manual download |
 
-With the Wiley and Elsevier tokens, roughly half of the list looks reachable.
+With the Wiley and Elsevier keys, roughly half of the list looks reachable.
 
-**Storage:** Phase A produced 17.1 GB (median PDF 1.5 MB). The whole list would be about 140 GB, so check the quota on cloud.ovgu.de. Zipping the PDFs saves only about 13% (they are already compressed internally) and would make single files impossible to browse in the cloud, so the PDFs are uploaded as they are.
+**Storage:** so far 17.1 GB for 7,177 PDFs (median 1.5 MB). The whole list would be about 150 GB. As much as possible stays in the cloud (about 100 GB available on cloud.ovgu.de); the rest goes on an external drive. Zipping the PDFs saves only about 13% (they are already compressed internally) and would make single files impossible to browse in the cloud, so the PDFs are uploaded as they are.
 
 **Open items:**
 
-1. Library request (by the supervisor, after their return): send `reports/missing_by_publisher.csv` and `reports/publisher_summary.csv` with the TDM request (Elsevier, Wiley/Hindawi, Springer Nature, IEEE). The list now includes the 1,146 papers whose PDF is only a notice or first page.
-2. Decide how to handle the notice-only PDFs. Decided (option A): keep them, marked with the status right after the ID (`<ID> [notice] - <title>.pdf`), so the real article can be saved when it is obtained.
-3. Check the 54 `mismatch` PDFs by hand.
-4. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
-5. Look up DOIs for the 5,950 entries without one (Crossref title search with strict matching).
+1. **API keys:** request an Elsevier API key (dev.elsevier.com) and a Wiley TDM token directly from the publishers, then run a small Phase B test (`windows/run_phase_b.cmd` with `TEST=1`) and check the results with `verify`.
+2. **Library** (ub.it-anwendungen@ovgu.de, supervisor in cc): only after trying the publishers directly, for the publishers whose APIs are not available to us. Attach the list of missing papers by publisher.
+3. **Notice-only papers (1,146, of which 852 from Springer):** the retracted article itself often still exists. On Springer's article pages it is usually attached under "Electronic supplementary material" (example: `10.1007/s10854-016-4998-z`). Get the real article for each of these papers; if it is not available anywhere, mark the paper as "article not found" so it is clear the article itself is missing. The notice files are kept (`<ID> [notice] - <title>.pdf`). How these attachments can be fetched within the rules (official API, or manually) is still being clarified.
+4. **Failed downloads:** keep track of every paper that failed (status `failed`, with the reason, in the database and in `index.csv`) and prepare a list so they can be downloaded manually at the end.
+5. Check the 54 `mismatch` PDFs by hand (in progress).
+6. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
+7. Look up DOIs for the 5,950 entries without one (Crossref title search with strict matching).

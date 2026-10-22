@@ -1,5 +1,9 @@
 # Retracted-papers PDF downloader
 
+Research project at Otto von Guericke University Magdeburg (OVGU): collecting the full texts of the ~64,000 retracted papers listed by [Retraction Watch](https://retractionwatch.com), for later analysis. Maintained by Abdalla Ahmed (student research assistant).
+
+**Current state (week 3):** 7,177 PDFs downloaded from open-access sources, of which 6,031 are full articles and 1,146 only the retraction notice or the article's first page. Next: the publishers' TDM APIs (Elsevier, Wiley) as soon as the API keys are in place. Details, numbers and open items: [ANALYSIS.md](ANALYSIS.md).
+
 `fetch_pdfs.py` downloads the PDFs for the DOIs in the Retraction Watch CSV and saves each one as `<ID block>/<RW ID> - <title>.pdf`, e.g. `001001-002000/001454 - Circulatory Responses ….pdf`. It uses only legal channels: open-access indexes and the publishers' official text-and-data-mining (TDM) APIs. It never logs in to your university account and never tries to get past bot protection.
 
 **About the CSV:** `retraction_watch_1.10.26 - short-version.csv` (columns `ID`, `Title`, `OriginalPaperDOI`) has 72,790 rows, which become 63,790 unique DOIs after cleaning. 5,950 rows have no usable DOI; they're kept in the database (table `no_doi`) so you can handle them by hand.
@@ -138,9 +142,14 @@ python fetch_pdfs.py report                             # counts per status and 
 
 ## 3. Getting access to the paywalled papers
 
-Ask your library for TDM access. Here is a short email you can adapt:
+**First, request API keys from the publishers directly:**
 
-> For a research project on retracted literature I need the full texts of ~64,000 retracted articles (list attached, DOIs). I'd like to obtain them via the publishers' TDM APIs (Elsevier, Wiley, Springer Nature, IEEE) under §60d UrhG rather than by manual downloading. Can you provide an Elsevier institutional token / confirm our TDM entitlements, and advise for IEEE and Springer Nature?
+- **Elsevier:** create an API key on the [Elsevier Developer Portal](https://dev.elsevier.com) and put it in `.env` as `ELSEVIER_API_KEY`. Elsevier recognises the university's subscriptions by its network, so run Phase B from the university network or VPN. An institutional token (`ELSEVIER_INSTTOKEN`) is only needed to work from outside it.
+- **Wiley:** request a text-and-data-mining token with your Wiley Online Library account and put it in `.env` as `WILEY_TDM_TOKEN`.
+
+**Then ask the library** for whatever the publishers' own APIs don't cover (IEEE, Springer Nature, Taylor & Francis, SAGE, …). Here is a short email you can adapt:
+
+> For a research project on retracted literature I need the full texts of retracted articles (list attached, DOIs). I'd like to obtain them via the publishers' TDM interfaces under §60d UrhG rather than by manual downloading. Can you confirm our TDM entitlements and advise how to get access for the publishers on the list?
 
 Attach the files made by
 
@@ -150,12 +159,12 @@ python fetch_pdfs.py summary --out-dir reports --email you@uni.de
 
 `reports/missing_by_publisher.csv` lists every missing DOI grouped by publisher (names looked up at Crossref) with the main reason it is missing. `reports/publisher_summary.csv` gives one row per publisher with counts per reason and the suggested legal route. If `verify` has been run, PDFs it found to be only a retraction notice or a first page count as missing (reason `PDF is only a retraction notice or first page`, status `pdf_incomplete`), because the full article still has to be obtained.
 
-Still missing after Phase A (largest publishers):
+Still missing right after Phase A (largest publishers; current numbers in [ANALYSIS.md](ANALYSIS.md)):
 
 | DOI prefix | Publisher | Missing | Route |
 |---|---|---|---|
 | 10.1155 | Hindawi | 11,749 | Open access, but the download site blocks bots → Wiley TDM API |
-| 10.1016 | Elsevier | 8,071 | Elsevier API (key + institutional token) |
+| 10.1016 | Elsevier | 8,071 | Elsevier API key (from the university network) |
 | 10.1109 | IEEE | 7,770 | Library arrangement; no public TDM PDF API |
 | 10.1007 | Springer | 5,528 | Springer Nature TDM via the library |
 | 10.1002 / 10.1111 | Wiley | 3,677 | Wiley TDM token |
