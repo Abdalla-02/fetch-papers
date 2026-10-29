@@ -1,6 +1,6 @@
 # Retracted-papers PDF download: analysis report
 
-*Status: 22 October 2026 (week 3). Phase A (open access) and a retry of temporary failures are complete, and every PDF has been checked. Phase B (publisher TDM APIs) is prepared; the API keys are being requested directly from the publishers (Elsevier, Wiley).*
+*Status: 29 October 2026 (week 3). Phase A (open access) and a retry of temporary failures are complete, and every PDF has been checked. The Elsevier API key and the Wiley TDM token are in place and were tested on 29 October (section 8); the full Phase B run is next.*
 
 ## 1. Summary
 
@@ -8,7 +8,7 @@
 - **Phase A downloaded 7,005 PDFs (11.0%, 17.1 GB)** from open-access sources in 3 h 24 min, with no crashes and no API errors. A retry one week later added 172 (7,177 in total).
 - **Quality check (week 2): 1,146 of these PDFs are only the retraction notice or the article's first page**, not the article. So **6,031 papers (9.5%) have a full-text PDF**; 57,759 are still missing (see section 5).
 - Of the 57,759 missing papers, **35,367 (61%) have no open-access copy at all**, **19,836 (34%) have an open-access link, but the publisher's site refused the download**, mostly through Cloudflare or similar bot protection, and 1,146 (2%) have only a notice / first page as PDF.
-- The biggest single group, **Hindawi (11,757 missing, 20% of all missing papers)**, is open access (CC-BY), but its download server is behind a Cloudflare bot check. Hindawi is now part of Wiley, so the Wiley TDM API may provide these papers; this will be tested as soon as a token is available.
+- The biggest single group, **Hindawi (11,757 missing, 20% of all missing papers)**, is open access (CC-BY), but its download server is behind a Cloudflare bot check. Hindawi is now part of Wiley, and a test on 29 October confirmed that the Wiley TDM API delivers these papers as full PDFs.
 - Most of the remaining papers can only be obtained legally through the publishers' text-and-data-mining (TDM) APIs. The API keys are requested directly from the publishers first; the university library is asked only for what they don't cover. The per-publisher list of missing papers is in `reports/missing_by_publisher.csv`.
 
 ## 2. Input data
@@ -184,8 +184,9 @@ The verdicts are stored in the database (table `checks`), shown in `index.csv` (
 | `summary` counts notice / first-page-only PDFs as missing (status `pdf_incomplete`); column `downloaded` renamed to `full_text_pdfs` | The library list must include papers whose full text is still missing |
 | New option `run --retry-temporary` (week 2) | Retries only timeouts, network and server errors, without contacting the sites that blocked us again |
 | A site asking for a pause (`Retry-After`) longer than 120 s is skipped for the rest of the run; if one of the APIs asks for it (e.g. a quota), the run stops cleanly and leaves the remaining papers untouched (week 2) | A server answering "503, Retry-After: 3600" stalled the retry run for hours; skipping an API instead would have marked every remaining paper as failed |
-| Phase B preparation (week 3): API keys from a `.env` file (`.env.example` in the repo), `--wiley-prefixes` (Hindawi `10.1155` can be switched on after a test), status `incomplete` with `mark-incomplete` and `--retry-incomplete`, Windows template `windows/run_phase_b.cmd` | Phase B can start as soon as the keys arrive; notice-only papers get a second chance through the APIs while the notice files are kept |
+| Phase B preparation (week 3): API keys from a `.env` file (`.env.example` in the repo), `--wiley-prefixes` (Hindawi `10.1155` included since the test on 29 October), status `incomplete` with `mark-incomplete` and `--retry-incomplete`, Windows template `windows/run_phase_b.cmd` | Phase B can start as soon as the keys arrive; notice-only papers get a second chance through the APIs while the notice files are kept |
 | A rejected API key (HTTP 401) or an API still answering 429 after retries stops the run; papers that no selected source can handle are not touched (week 3) | A wrong key or a used-up quota must not turn thousands of papers into 'failed', and a Phase B run must not overwrite the Phase A reasons of papers it cannot handle |
+| After the Phase B test (week 3): Elsevier full texts saved as XML (an abstract-only answer is not kept); Cochrane reviews never sent to the Wiley API; old SICI DOIs stored with `%3c`/`%3e` no longer escaped twice; `verify` leaves out PDFs decided by hand (check note `manual check …`) and XML files | Elsevier sends the PDF only as its first page, but the full text as XML; 4 of the 6 Wiley failures in the test were Cochrane reviews (403), and 8 refusals in a row would get the whole Wiley API skipped; running `verify` after Phase B would have reset the 21 manually confirmed papers to `mismatch` |
 | `verify` warns about files renamed to a Windows short name like `049929~1.PDF` (week 3) | The Nextcloud client renamed one PDF this way |
 | PDF folder check before `run`, `verify`, `mark-incomplete`, `rename` (stop if < 90% of the expected PDFs are on disk; `--skip-folder-check` overrides) (week 3) | On 2026-10-16 the Nextcloud folder looked empty while the client (virtual files) was closed; a run would then have downloaded everything again and `rename` would have updated the database for files it could not see |
 | Offline test suite `tests/test_fetch_pdfs.py` (week 2) | The checks done so far by hand (blocking, no key leak, Retry-After, subfolders, verify) can be rerun after every change |
@@ -201,8 +202,8 @@ Things that were deliberately **not** done: no browser automation (e.g. Puppetee
 |---|---|---|---|
 | A | Unpaywall + OpenAlex (open access) | **done: 7,005 PDFs (11%)** | – |
 | A (retry) | same, `--retry-temporary` | **done: 172 more PDFs** (7,177 in total; 1,146 of them only a notice / first page) | – |
-| B | Wiley TDM (incl. Hindawi, if Wiley serves 10.1155) | up to ~15,400 | Wiley TDM token (requested directly from Wiley) |
-| B | Elsevier API | up to ~8,000 | Elsevier API key (dev.elsevier.com), used from the university network |
+| B | Wiley TDM (incl. Hindawi) | **tested: 14 of 20 Wiley + 2 of 2 Hindawi as full PDFs**; up to ~14,900 (Cochrane excluded) | Wiley TDM token (in place) |
+| B | Elsevier API | **tested: full text as XML (the PDF is only the first page)**; up to ~8,100 | Elsevier API key (in place), university network or full-tunnel VPN |
 | C | Crossref full-text links | depends on licences | library approval, university network |
 | – | IEEE, Springer Nature, T&F, SAGE, IOS Press … | – | publisher APIs where available, otherwise library |
 | end | Papers that still failed | – | manual download |
@@ -213,10 +214,31 @@ With the Wiley and Elsevier keys, roughly half of the list looks reachable.
 
 **Open items:**
 
-1. **API keys:** request an Elsevier API key (dev.elsevier.com) and a Wiley TDM token directly from the publishers, then run a small Phase B test (`windows/run_phase_b.cmd` with `TEST=1`) and check the results with `verify`.
+1. **Phase B full run** (Wiley incl. Hindawi, Elsevier as XML), then check the results. At 1 Wiley request every 10 s this takes about 43 hours.
 2. **Library** (ub.it-anwendungen@ovgu.de, supervisor in cc): only after trying the publishers directly, for the publishers whose APIs are not available to us. Attach the list of missing papers by publisher.
 3. **Notice-only papers (1,146, of which 852 from Springer):** the retracted article itself often still exists. On Springer's article pages it is usually attached under "Electronic supplementary material" (example: `10.1007/s10854-016-4998-z`). Get the real article for each of these papers; if it is not available anywhere, mark the paper as "article not found" so it is clear the article itself is missing. The notice files are kept (`<ID> [notice] - <title>.pdf`). How these attachments can be fetched within the rules (official API, or manually) is still being clarified.
 4. **Failed downloads:** keep track of every paper that failed (status `failed`, with the reason, in the database and in `index.csv`) and prepare a list so they can be downloaded manually at the end.
-5. Check the 54 `mismatch` PDFs by hand (in progress).
-6. Test whether the Wiley TDM API serves Hindawi DOIs (10.1155) as soon as a token is available.
-7. Look up DOIs for the 5,950 entries without one (Crossref title search with strict matching).
+5. Look up DOIs for the 5,950 entries without one (Crossref title search with strict matching).
+
+## 8. Week 3: mismatch review and Phase B test (29 October 2026)
+
+**Mismatch review.** The 54 PDFs whose first pages contained neither the title nor the DOI were checked by hand, and the decisions were cross-checked by searching each PDF's full text for the title and DOI:
+
+| Decision | PDFs | What happened |
+|---|---|---|
+| Correct paper | 4 | kept (one of them is a 563-page conference supplement that contains the retracted abstract) |
+| Correct paper, other language | 17 | kept (mostly Russian) |
+| Only the retraction notice | 1 | kept as `[notice]`, status `incomplete` |
+| Wrong document | 32 | moved (not deleted) to `_wrong_documents`, status back to `failed`, on the manual-download list |
+
+So 32 of the 54 suspicious files (59%) were a different document: an open-access index linked the DOI to an unrelated file (other papers, reports, drug labels, theses).
+
+**Phase B test.** The VPN has to run in full-tunnel mode: with a split tunnel the publishers see the home connection and refuse the full texts.
+
+| API | Test | Result |
+|---|---|---|
+| Wiley (10.1002) | 20 random missing papers | 14 full PDFs (6–22 pages, all checked OK); 4 Cochrane reviews refused (403); 2 not found (404), one of them because of a DOI escaping bug, now fixed |
+| Wiley for Hindawi (10.1155) | 2 random missing papers | 2 full PDFs |
+| Elsevier (10.1016) | 2 articles | full text as XML (body included); as a PDF only the first page |
+
+Elsevier full texts are therefore saved as XML (structured full text, figures only referenced). With these results, about 14,900 Wiley/Hindawi papers and 8,100 Elsevier papers are reachable through the official APIs, about 36% of the list.

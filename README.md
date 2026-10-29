@@ -2,7 +2,7 @@
 
 Research project at Otto von Guericke University Magdeburg (OVGU): collecting the full texts of the ~64,000 retracted papers listed by [Retraction Watch](https://retractionwatch.com), for later analysis. Maintained by Abdalla Ahmed (student research assistant).
 
-**Current state (week 3):** 7,177 PDFs downloaded from open-access sources, of which 6,031 are full articles and 1,146 only the retraction notice or the article's first page. Next: the publishers' TDM APIs (Elsevier, Wiley) as soon as the API keys are in place. Details, numbers and open items: [ANALYSIS.md](ANALYSIS.md).
+**Current state (week 3):** 7,177 PDFs downloaded from open-access sources, of which 6,031 are full articles and 1,146 only the retraction notice or the article's first page. The Elsevier key and the Wiley token are in place and tested: Wiley (including Hindawi) delivers full PDFs, Elsevier full texts as XML. Next: the full Phase B run. Details, numbers and open items: [ANALYSIS.md](ANALYSIS.md).
 
 `fetch_pdfs.py` downloads the PDFs for the DOIs in the Retraction Watch CSV and saves each one as `<ID block>/<RW ID> - <title>.pdf`, e.g. `001001-002000/001454 - Circulatory Responses ….pdf`. It uses only legal channels: open-access indexes and the publishers' official text-and-data-mining (TDM) APIs. It never logs in to your university account and never tries to get past bot protection.
 
@@ -96,13 +96,14 @@ The note column also flags PDFs with more than 60 pages (probably a whole issue 
    # the same again with --prefix 10.1002, then:
    python fetch_pdfs.py verify --out /data/retracted_pdfs
    ```
-   Elsevier may send only the first page of the PDF if there is no entitlement for an article; `verify` shows these as `short`.
+   Elsevier full texts are saved as XML (`<ID> - <title>.xml`): as a PDF, the API only sends the first page. An XML that contains only the abstract (no entitlement) is not kept; the paper is marked `failed` with `XML has no full text, only the abstract`.
 4. **Full run:** the same command without `--prefix` and `--limit`. On Windows, use [`windows/run_phase_b.cmd`](windows/run_phase_b.cmd) (`TEST=1` for step 3, `TEST=0` for the full run).
 
 Good to know:
 
-- Only papers that the configured APIs can handle are touched (Elsevier: DOIs `10.1016/…`; Wiley: the prefixes in `--wiley-prefixes`, default `10.1002,10.1111`). All other papers keep their status and the reason from earlier runs.
-- **Hindawi (`10.1155`) via Wiley:** add it with `--wiley-prefixes 10.1002,10.1111,10.1155` once a small test shows that the Wiley API delivers Hindawi papers.
+- Only papers that the configured APIs can handle are touched (Elsevier: DOIs `10.1016/…`; Wiley: the prefixes in `--wiley-prefixes`, default `10.1002,10.1111,10.1155`, the last one being Hindawi). All other papers keep their status and the reason from earlier runs.
+- **Cochrane reviews** (`10.1002/14651858.…`) are never sent to the Wiley API: they are licensed separately and refused (403), and a run of them in a row would get the whole API skipped for the run.
+- **Network:** run Phase B from the university network, or with the VPN in **full-tunnel** mode. With a split tunnel, the publishers see the home connection: Elsevier then answers `403 … Requestor configuration settings insufficient`.
 - If an API rejects the key (HTTP 401) or keeps answering 429 (rate limit or quota used up), the run stops with `STOPPED EARLY` and exit code 3, without marking any paper as failed. Fix the key or wait, then run the same command again.
 - Papers with status `incomplete` keep it (and their notice file) if the APIs find nothing; if the real article is downloaded, it is saved under the normal name next to the notice file.
 
@@ -144,7 +145,7 @@ python fetch_pdfs.py report                             # counts per status and 
 
 **First, request API keys from the publishers directly:**
 
-- **Elsevier:** create an API key on the [Elsevier Developer Portal](https://dev.elsevier.com) and put it in `.env` as `ELSEVIER_API_KEY`. Elsevier recognises the university's subscriptions by its network, so run Phase B from the university network or VPN. An institutional token (`ELSEVIER_INSTTOKEN`) is only needed to work from outside it.
+- **Elsevier:** create an API key on the [Elsevier Developer Portal](https://dev.elsevier.com) and put it in `.env` as `ELSEVIER_API_KEY`. Elsevier recognises the university's subscriptions by its network, so run Phase B from the university network or a full-tunnel VPN. An institutional token (`ELSEVIER_INSTTOKEN`) is only needed to work from outside it.
 - **Wiley:** request a text-and-data-mining token with your Wiley Online Library account and put it in `.env` as `WILEY_TDM_TOKEN`.
 
 **Then ask the library** for whatever the publishers' own APIs don't cover (IEEE, Springer Nature, Taylor & Francis, SAGE, …). Here is a short email you can adapt:
@@ -209,4 +210,4 @@ rclone copy /data/retracted_pdfs cloud:RetractedPapers --progress   # repeat aft
 python tests/test_fetch_pdfs.py
 ```
 
-The tests run offline against a small local web server that plays Unpaywall and some publisher sites. They check the file naming, the classification of failures, that a Cloudflare-blocked site gets exactly 8 requests and is then skipped, that API keys are not forwarded across redirects, that PDFs land in their ID-block folder, both kinds of long `Retry-After` (site skipped / run stopped), reading `.env`, Elsevier and Wiley downloads through fake APIs (Hindawi only when switched on), that a rejected key or a used-up quota stops the run without marking papers as failed, that papers no source can handle stay untouched, that the commands stop when most PDFs are missing from the folder, `mark-incomplete` with a later `--retry-incomplete`, and the `verify` verdicts on small generated PDFs. Run them after every change to the script.
+The tests run offline against a small local web server that plays Unpaywall and some publisher sites. They check the file naming, the classification of failures, that a Cloudflare-blocked site gets exactly 8 requests and is then skipped, that API keys are not forwarded across redirects, that PDFs land in their ID-block folder, both kinds of long `Retry-After` (site skipped / run stopped), reading `.env`, Elsevier (XML, abstract-only answers rejected) and Wiley downloads through fake APIs (Hindawi included, Cochrane never sent, SICI DOIs with `%3c` not escaped twice), that `verify` leaves out manual decisions and XML files, that a rejected key or a used-up quota stops the run without marking papers as failed, that papers no source can handle stay untouched, that the commands stop when most PDFs are missing from the folder, `mark-incomplete` with a later `--retry-incomplete`, and the `verify` verdicts on small generated PDFs. Run them after every change to the script.
