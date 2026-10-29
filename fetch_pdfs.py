@@ -6,7 +6,9 @@ Sources (tried in this order, each one optional):
   1. unpaywall  - free open-access PDF links            (needs: your e-mail)
   2. openalex   - second open-access index              (needs: your e-mail)
   3. elsevier   - Elsevier TDM API, 10.1016/* only      (needs: ELSEVIER_API_KEY [+ ELSEVIER_INSTTOKEN])
-  4. wiley      - Wiley TDM API, 10.1002/* and 10.1111/* (needs: WILEY_TDM_TOKEN)
+                  full text is saved as XML: the API sends the PDF only as its first page
+  4. wiley      - Wiley TDM API, 10.1002/*, 10.1111/* and Hindawi 10.1155/* (needs: WILEY_TDM_TOKEN)
+                  Cochrane reviews (10.1002/14651858.*) are skipped: the API refuses them
   5. crossref   - publisher full-text links registered in Crossref for text mining
                   (works for subscribed content only when run from the university network/VPN)
 
@@ -25,7 +27,7 @@ Usage:
   python fetch_pdfs.py rename  --out /data/retracted_pdfs [--dry-run]
 
 PDFs are saved as '<ID block>/<RW ID> - <title>.pdf' (title cut to 150 characters),
-e.g. '001001-002000/001454 - Circulatory Responses ....pdf'.
+e.g. '001001-002000/001454 - Circulatory Responses ....pdf'. Elsevier full texts end in '.xml'.
 
 Requires: Python 3.9+, `pip install httpx` (and `pip install pypdf cryptography` for 'verify')
 """
@@ -43,7 +45,7 @@ import time
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
@@ -56,7 +58,14 @@ WILEY = os.environ.get("WILEY_BASE", "https://api.wiley.com")
 CROSSREF = os.environ.get("CROSSREF_BASE", "https://api.crossref.org")
 
 ALL_SOURCES = ["unpaywall", "openalex", "elsevier", "wiley", "crossref"]
-WILEY_PREFIXES = "10.1002,10.1111"   # default DOI prefixes for the Wiley TDM API (--wiley-prefixes)
+WILEY_PREFIXES = "10.1002,10.1111,10.1155"   # default DOI prefixes for the Wiley TDM API (--wiley-prefixes)
+# never sent to the Wiley TDM API: Cochrane Library reviews are licensed separately and refused (403);
+# a run of them in a row would otherwise get the whole API skipped (BLOCK_AFTER)
+WILEY_SKIP = ("10.1002/14651858.",)
+# sources whose full text is saved as XML instead of PDF (Elsevier sends the PDF only as its first page)
+XML_SOURCES = ("elsevier",)
+# an Elsevier XML without one of these has only the abstract (no entitlement for the full text)
+ELSEVIER_FULLTEXT_MARKERS = (b"<ce:sections", b"<xocs:rawtext", b"<ce:para")
 # the index/TDM APIs themselves (as opposed to publisher and repository sites)
 API_HOSTS = {urlparse(base).hostname for base in (UNPAYWALL, OPENALEX, ELSEVIER, WILEY, CROSSREF)}
 
@@ -142,6 +151,16 @@ def make_filename(record_ids: str, title: str) -> str:
 
 def looks_like_pdf(first_bytes: bytes) -> bool:
     return b"%PDF" in first_bytes[:1024]
+
+
+def looks_like_xml(first_bytes: bytes) -> bool:
+    head = first_bytes[:1024].lstrip().lower()
+    return head.startswith(b"<") and b"<html" not in head and b"<!doctype html" not in head
+
+
+def file_ext(source: str | None) -> str:
+    """Extension of a downloaded full text: '.xml' for XML_SOURCES, otherwise '.pdf'."""
+    return ".xml" if source in XML_SOURCES else ".pdf"
 
 
 # ----------------------------------------------------------------------------- database
@@ -295,7 +314,7 @@ class Fetcher:
         self.els_key = os.environ.get("ELSEVIER_API_KEY")
         self.els_inst = os.environ.get("ELSEVIER_INSTTOKEN")
         self.wiley_tok = os.environ.get("WILEY_TDM_TOKEN")
-        # DOI prefixes sent to the Wiley TDM API; add 10.1155 (Hindawi) once it is confirmed to work
+        # DOI prefixes sent to the Wiley TDM API (Hindawi 10.1155 confirmed to work, Oct 2026)
         self.wiley_prefixes = tuple(p.strip().rstrip("/") + "/" for p in
                                     getattr(args, "wiley_prefixes", WILEY_PREFIXES).split(",") if p.strip())
         self.ua = f"RetractedPapersResearch/1.0 (mailto:{args.email})"
@@ -378,7 +397,9 @@ class Fetcher:
     async def candidates(self, client, doi, lookup_errors: list):
         """Yield (source, url, extra_headers) in priority order.
         Failed index lookups are appended to `lookup_errors`."""
-        q = quote(doi, safe="")
+        # some old (SICI) DOIs are stored with '<' / '>' already escaped as %3c / %3e - unescape first,
+        # otherwise the '%' itself is escaped again (%253c) and the API does not find the article
+        q = quote(unquote(doi), safe="")
         for src in self.sources:
             try:
                 if src == "unpaywall":
@@ -403,11 +424,12 @@ class Fetcher:
                                 seen.add(u)
                                 yield "openalex", u, None
                 elif src == "elsevier" and self.els_key and doi.startswith("10.1016/"):
-                    h = {"X-ELS-APIKey": self.els_key, "Accept": "application/pdf"}
+                    # full text as XML: as a PDF the API only sends the first page
+                    h = {"X-ELS-APIKey": self.els_key, "Accept": "text/xml"}
                     if self.els_inst:
                         h["X-ELS-Insttoken"] = self.els_inst
-                    yield "elsevier", f"{ELSEVIER}/content/article/doi/{doi}?httpAccept=application/pdf", h
-                elif src == "wiley" and self.wiley_tok and doi.startswith(self.wiley_prefixes):
+                    yield "elsevier", f"{ELSEVIER}/content/article/doi/{doi}?view=FULL", h
+                elif src == "wiley" and self.wiley_handles(doi):
                     yield "wiley", f"{WILEY}/onlinelibrary/tdm/v1/articles/{q}", {"Wiley-TDM-Client-Token": self.wiley_tok}
                 elif src == "crossref":
                     j = await self.get_json(client, f"{CROSSREF}/works/{q}?mailto={quote(self.a.email)}")
@@ -422,9 +444,10 @@ class Fetcher:
                 if self.a.verbose:
                     print(f"  ! {src} lookup failed for {doi}: {e}", file=sys.stderr)
 
-    # -- download one PDF ---------------------------------------------------
+    # -- download one PDF (or Elsevier XML) ----------------------------------
     async def download(self, client, url, headers, dest: Path):
-        tmp = dest.with_suffix(".pdf.part")
+        xml = dest.suffix == ".xml"
+        tmp = dest.with_name(dest.name + ".part")
         h = {"Accept": "application/pdf,*/*;q=0.8"}
         h.update(headers or {})
         try:
@@ -450,7 +473,10 @@ class Fetcher:
                 async for chunk in r.aiter_bytes(65536):
                     if not first:
                         first = chunk
-                        if not looks_like_pdf(first):
+                        if xml and not looks_like_xml(first):
+                            self.limiter.refused(final, "HTML page instead of XML")
+                            return "not XML (got HTML/login page?)" + via
+                        if not xml and not looks_like_pdf(first):
                             self.limiter.refused(final, "HTML page instead of PDF")
                             return "not a PDF (got HTML/login page?)" + via
                     size += len(chunk)
@@ -459,6 +485,8 @@ class Fetcher:
                     f.write(chunk)
             if size < 1000:
                 return "file too small"
+            if xml and not any(m in tmp.read_bytes() for m in ELSEVIER_FULLTEXT_MARKERS):
+                return "XML has no full text, only the abstract (not entitled?)"
             os.replace(tmp, dest)
             self.limiter.refusals[urlparse(final).hostname or ""] = 0
             return None
@@ -472,13 +500,17 @@ class Fetcher:
         if dest.exists() and dest.stat().st_size > 1000:
             self.save(doi, "done", "already_on_disk", None, None)
             return
+        xml_dest = self.out / f"{filename}.xml"
+        if xml_dest.exists() and xml_dest.stat().st_size > 1000:   # Elsevier full text from an earlier run
+            self.save(doi, "done", XML_SOURCES[0], None, None)
+            return
         errors, tried, lookup_errors = [], set(), []
         async for src, url, headers in self.candidates(client, doi, lookup_errors):
             if url in tried:
                 continue
             tried.add(url)
             try:
-                err = await self.download(client, url, headers, dest)
+                err = await self.download(client, url, headers, self.out / f"{filename}{file_ext(src)}")
             except StopRun:
                 raise
             except Exception as e:
@@ -533,9 +565,12 @@ class Fetcher:
                 return True
             if src == "elsevier" and self.els_key and doi.startswith("10.1016/"):
                 return True
-            if src == "wiley" and self.wiley_tok and doi.startswith(self.wiley_prefixes):
+            if src == "wiley" and self.wiley_handles(doi):
                 return True
         return False
+
+    def wiley_handles(self, doi: str) -> bool:
+        return bool(self.wiley_tok) and doi.startswith(self.wiley_prefixes) and not doi.startswith(WILEY_SKIP)
 
     async def run(self):
         retry_failed = self.a.retry_failed or self.a.retry_temporary
@@ -646,7 +681,7 @@ def write_index(con, out: Path):
         folder, _, name = fn.rpartition("/")
         done = status in ("done", "incomplete")
         rows.append([first_id(ids), ids, doi, doi.split("/")[0], title, folder if done else "",
-                     f"{name}.pdf" if done else "", status, (check or "") if done else "",
+                     f"{name}{file_ext(source)}" if done else "", status, (check or "") if done else "",
                      source, url, (err or "")[:300]])
     for rid, title, raw in con.execute("SELECT record_id, title, raw_doi FROM no_doi"):
         rows.append([first_id(rid), rid, raw, "", title, "", "", "no_doi", "", "", "", "no usable DOI in the CSV"])
@@ -671,9 +706,9 @@ def cmd_index(args):
 # ----------------------------------------------------------------------------- summary for the library
 # How the still-missing papers of the big publishers can be obtained legally.
 ROUTES = {
-    "10.1155": "Wiley TDM API (Hindawi is part of Wiley) - open access, download site blocks bots",
-    "10.1002": "Wiley TDM API (token)", "10.1111": "Wiley TDM API (token)",
-    "10.1016": "Elsevier Article Retrieval API (API key + institutional token)",
+    "10.1155": "Wiley TDM API (token; Hindawi is part of Wiley) - open access, download site blocks bots",
+    "10.1002": "Wiley TDM API (token; not Cochrane reviews)", "10.1111": "Wiley TDM API (token)",
+    "10.1016": "Elsevier Article Retrieval API (API key, university network) - full text as XML",
     "10.1109": "IEEE - no public TDM PDF API; library arrangement",
     "10.1007": "Springer Nature TDM - library", "10.1186": "Springer Nature TDM - library",
     "10.1038": "Springer Nature TDM - library",
@@ -883,12 +918,13 @@ def check_pdf_folder(con, out: Path, args):
     it cannot see, and 'verify' / 'mark-incomplete' would report nonsense. --skip-folder-check overrides."""
     if getattr(args, "skip_folder_check", False):
         return
-    expected = [marked_name(fn, v) if status == "incomplete" else fn for fn, status, v in con.execute(
-        "SELECT filename, status, c.verdict FROM papers p LEFT JOIN checks c ON c.doi = p.doi "
-        "WHERE p.status IN ('done', 'incomplete')")]
+    expected = [marked_name(fn, v) + ".pdf" if status == "incomplete" else fn + file_ext(src)
+                for fn, status, v, src in con.execute(
+                    "SELECT filename, status, c.verdict, p.source FROM papers p LEFT JOIN checks c ON c.doi = p.doi "
+                    "WHERE p.status IN ('done', 'incomplete')")]
     if len(expected) < FOLDER_CHECK_MIN:
         return
-    present = sum(1 for fn in expected if (out / f"{fn}.pdf").exists())
+    present = sum(1 for fn in expected if (out / fn).exists())
     if present < FOLDER_CHECK_SHARE * len(expected):
         sys.exit(f"STOPPED: only {present} of {len(expected)} PDFs that the database expects are in {out}.\n"
                  f"Is this the right --out folder? If it is a Nextcloud/OneDrive folder with 'virtual files', "
@@ -896,8 +932,22 @@ def check_pdf_folder(con, out: Path, args):
                  f"Nothing was changed. If the folder really is meant to be empty or new, add --skip-folder-check.")
 
 
+MANUAL_CHECK = "manual check"   # a 'checks' note starting with this is a person's decision
+
+
+def papers_to_verify(con) -> list:
+    """Downloaded PDFs to check. Left out: XML full texts (checked for a body when downloaded) and
+    PDFs a person has already looked at (check note 'manual check ...'), so 'verify' never
+    overwrites their decision. A new download of the paper clears the note (see Fetcher.save)."""
+    return con.execute(
+        "SELECT p.doi, record_ids, title, filename FROM papers p LEFT JOIN checks c ON c.doi = p.doi "
+        f"WHERE p.status='done' AND COALESCE(p.source, '') NOT IN ({','.join('?' * len(XML_SOURCES))}) "
+        "AND COALESCE(c.note, '') NOT LIKE ?", [*XML_SOURCES, MANUAL_CHECK + "%"]).fetchall()
+
+
 def cmd_verify(args):
-    """Check every downloaded PDF against its title and DOI; write <out-dir>/verify.csv."""
+    """Check every downloaded PDF against its title and DOI; write <out-dir>/verify.csv.
+    PDFs with a manual decision and XML full texts are not checked again (see papers_to_verify)."""
     import importlib.util
     if importlib.util.find_spec("pypdf") is None:
         sys.exit("verify needs pypdf:  pip install pypdf cryptography")
@@ -906,10 +956,12 @@ def cmd_verify(args):
     out, rep = Path(args.out), Path(args.out_dir)
     check_pdf_folder(con, out, args)
     rep.mkdir(parents=True, exist_ok=True)
-    papers = con.execute("SELECT doi, record_ids, title, filename FROM papers WHERE status='done'").fetchall()
+    papers = papers_to_verify(con)
+    skipped = con.execute("SELECT COUNT(*) FROM papers WHERE status='done'").fetchone()[0] - len(papers)
     if args.limit:
         papers = papers[:args.limit]
-    print(f"checking {len(papers)} PDFs with {args.workers} processes ...", flush=True)
+    print(f"checking {len(papers)} PDFs with {args.workers} processes "
+          f"({skipped} skipped: XML full texts or decided by hand) ...", flush=True)
     results = []
     with ProcessPoolExecutor(args.workers) as pool:
         jobs = [(p, pool.submit(verify_pdf, str(out / f"{p[3]}.pdf"), p[2] or "", p[0])) for p in papers]
@@ -1037,36 +1089,37 @@ def cmd_rename(args):
     new_names = [p[2].lower() for p in plan]
     if len(set(new_names)) != len(new_names):
         sys.exit("new file names are not unique - aborting, nothing changed")
-    files = [(doi, marked_name(old, v), marked_name(new, v)) for doi, old, new, st in changes
-             for v in [None] + list(MARK_LABELS)  # the PDF itself and any marked notice / first page
-             if (out / f"{marked_name(old, v)}.pdf").exists()]
-    print(f"{len(changes)} of {len(plan)} names change; {len(files)} PDFs on disk to rename")
+    # file names here include the extension: the PDF, any marked notice / first page, and an Elsevier XML
+    files = [(doi, marked_name(old, v) + ext, marked_name(new, v) + ext) for doi, old, new, st in changes
+             for v in [None] + list(MARK_LABELS) for ext in (".pdf", ".xml")
+             if (out / f"{marked_name(old, v)}{ext}").exists()]
+    print(f"{len(changes)} of {len(plan)} names change; {len(files)} files on disk to rename")
     for _, old, new in files[:10]:
-        print(f"  {old[:60]}.pdf\n   -> {new[:70]}.pdf")
-    clash = [new for _, _, new in files if (out / f"{new}.pdf").exists()]
+        print(f"  {old[:64]}\n   -> {new[:74]}")
+    clash = [new for _, _, new in files if (out / new).exists()]
     if clash:
-        sys.exit(f"{len(clash)} target files already exist (e.g. {clash[0]}.pdf) - aborting, nothing changed")
+        sys.exit(f"{len(clash)} target files already exist (e.g. {clash[0]}) - aborting, nothing changed")
     if args.dry_run:
         print("dry run - nothing changed")
         return
     done = []
     try:
         for _, old, new in files:
-            (out / f"{new}.pdf").parent.mkdir(parents=True, exist_ok=True)
-            os.rename(out / f"{old}.pdf", out / f"{new}.pdf")
+            (out / new).parent.mkdir(parents=True, exist_ok=True)
+            os.rename(out / old, out / new)
             done.append((old, new))
     except OSError as e:  # undo, so files and database stay consistent
         for old, new in reversed(done):
-            os.rename(out / f"{new}.pdf", out / f"{old}.pdf")
+            os.rename(out / new, out / old)
         sys.exit(f"rename failed ({e}) - undone, nothing changed")
     for _, old, _ in files:  # remove folders that the move left empty (never non-empty ones)
-        parent = (out / f"{old}.pdf").parent
+        parent = (out / old).parent
         if parent != out and parent.is_dir() and not any(parent.iterdir()):
             parent.rmdir()
     with con:  # one transaction; temporary names avoid UNIQUE clashes while swapping
         con.executemany("UPDATE papers SET filename='~tmp~'||doi WHERE doi=?", [(d,) for d, *_ in changes])
         con.executemany("UPDATE papers SET filename=? WHERE doi=?", [(new, d) for d, _, new, _ in changes])
-    print(f"updated {len(changes)} names in the database, renamed {len(done)} PDFs")
+    print(f"updated {len(changes)} names in the database, renamed {len(done)} files")
     write_index(con, out)
 
 
@@ -1088,7 +1141,8 @@ def cmd_report(args):
         with open(args.export, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["doi", "record_ids", "title", "filename", "status", "source", "pdf_url", "error"])
-            w.writerows(con.execute("SELECT doi, record_ids, title, filename||'.pdf', status, source, pdf_url, error FROM papers"))
+            w.writerows((doi, ids, title, fn + file_ext(src), st, src, url, err) for doi, ids, title, fn, st, src, url, err
+                        in con.execute("SELECT doi, record_ids, title, filename, status, source, pdf_url, error FROM papers"))
         print("exported to", args.export)
 
 
@@ -1122,7 +1176,7 @@ def main():
                    help="try again for papers whose PDF is only a notice / first page (see mark-incomplete)")
     r.add_argument("--wiley-prefixes", default=WILEY_PREFIXES,
                    help=f"DOI prefixes sent to the Wiley TDM API (default: {WILEY_PREFIXES}; "
-                        "add 10.1155 for Hindawi once tested)")
+                        f"never: {', '.join(WILEY_SKIP)} Cochrane)")
     r.add_argument("--progress-every", type=int, default=50)
     r.add_argument("-v", "--verbose", action="store_true")
     r.set_defaults(func=cmd_run)

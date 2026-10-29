@@ -27,6 +27,9 @@ LEAKED = []
 API_QUOTA_AFTER = {"n": 10**9}   # the fake Unpaywall answers 429 + Retry-After after this many lookups
 LOOKUPS = {"n": 0}
 PDF_BYTES = b"%PDF-1.4\n" + b"x" * 5000
+_ELS = b'<?xml version="1.0"?><full-text-retrieval-response><coredata>' + b"x" * 2000 + b"</coredata>%s"
+ELS_FULL_TEXT = _ELS % b"<originalText><ce:sections><ce:para>Body</ce:para></ce:sections></originalText></full-text-retrieval-response>"
+ELS_ABSTRACT_ONLY = _ELS % b"</full-text-retrieval-response>"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -66,14 +69,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(503, b"busy", [("Retry-After", "3600")])
         if kind == "good":
             return self.send(200, PDF_BYTES, [("Content-Type", "application/pdf")])
-        if kind == "els":                       # fake Elsevier Article Retrieval API
+        if kind == "els":                       # fake Elsevier Article Retrieval API (full text as XML)
             key = self.headers.get("X-ELS-APIKey")
             if key == "good":
-                return self.send(200, PDF_BYTES, [("Content-Type", "application/pdf")])
+                body = ELS_ABSTRACT_ONLY if "abs" in path else ELS_FULL_TEXT
+                return self.send(200, body, [("Content-Type", "text/xml")])
             if key == "quota":
                 return self.send(429, b"quota exceeded")
             return self.send(401, b"invalid api key")
         if kind == "wiley":                     # fake Wiley TDM API
+            if "%25" in self.path:              # a '%' escaped twice: no such article
+                return self.send(404)
+            if "14651858" in path:              # Cochrane reviews are not covered by the licence
+                return self.send(403, b"not entitled")
             if self.headers.get("Wiley-TDM-Client-Token") == "good":
                 return self.send(200, PDF_BYTES, [("Content-Type", "application/pdf")])
             return self.send(403, b"not entitled")
@@ -216,18 +224,40 @@ def test_load_env_file():
             os.environ.pop("WILEY_TDM_TOKEN", None)
 
 
-def test_wiley_prefixes_and_elsevier_download():
-    dois = ["10.1016/els-1", "10.1155/hin-1", "10.1002/wil-1"]
+def test_wiley_prefixes_and_elsevier_xml():
+    HITS.clear()
+    sici = "10.1002/(sici)1-2(1996)3:4%3c5::aid-x6%3e7.0.co;2-l"            # stored with '<' '>' escaped
+    dois = ["10.1016/els-1", "10.1016/abs-2", "10.1155/hin-1", "10.1002/wil-1", "10.1002/14651858.cd000001", sici]
     with env(ELSEVIER_API_KEY="good", WILEY_TDM_TOKEN="good"):
         con = make_db("tdm_default", dois)
         run_fetcher(con, "tdm_default", sources="elsevier,wiley")
         st = dict(con.execute("SELECT doi, status FROM papers"))
-        # Hindawi is not sent to Wiley by default, so it is left untouched
-        assert st == {"10.1016/els-1": "done", "10.1155/hin-1": "pending", "10.1002/wil-1": "done"}, st
-        con = make_db("tdm_hindawi", dois)                                 # Hindawi only when switched on
-        run_fetcher(con, "tdm_hindawi", sources="elsevier,wiley", wiley_prefixes="10.1002,10.1111,10.1155")
+        assert st == {"10.1016/els-1": "done", "10.1016/abs-2": "failed", "10.1155/hin-1": "done",
+                      "10.1002/wil-1": "done", "10.1002/14651858.cd000001": "pending", sici: "done"}, st
+        assert HITS[("localhost", "wiley")] == 3, HITS                    # Cochrane is never sent to Wiley
+        fn1, src1 = con.execute("SELECT filename, source FROM papers WHERE doi='10.1016/els-1'").fetchone()
+        assert src1 == "elsevier" and (TMP / "tdm_default" / f"{fn1}.xml").exists()      # Elsevier: XML, no PDF
+        assert not (TMP / "tdm_default" / f"{fn1}.pdf").exists()
+        err = con.execute("SELECT error FROM papers WHERE doi='10.1016/abs-2'").fetchone()[0]
+        assert "only the abstract" in err, err
+        fn2 = con.execute("SELECT filename FROM papers WHERE doi='10.1016/abs-2'").fetchone()[0]
+        assert not list((TMP / "tdm_default").rglob(f"{fn2.split('/')[1]}*")), "abstract-only XML was kept"
+        F.write_index(con, TMP / "tdm_default")
+        assert "000001 - Title 1.xml" in (TMP / "tdm_default" / "index.csv").read_text(encoding="utf-8-sig")
+        con = make_db("tdm_no_hindawi", dois[:4])                          # Hindawi can be switched off
+        run_fetcher(con, "tdm_no_hindawi", sources="elsevier,wiley", wiley_prefixes="10.1002,10.1111")
         st = dict(con.execute("SELECT doi, status FROM papers"))
-        assert st["10.1155/hin-1"] == "done", st
+        assert st["10.1155/hin-1"] == "pending", st
+
+
+def test_verify_skips_manual_decisions_and_xml():
+    con = make_db("verify_select", ["10.9999/a-1", "10.9999/b-2", "10.1016/c-3", "10.9999/d-4"])
+    con.execute("UPDATE papers SET status='done', source='unpaywall'")
+    con.execute("UPDATE papers SET source='elsevier' WHERE doi='10.1016/c-3'")
+    con.execute("INSERT INTO checks VALUES ('10.9999/b-2','ok','manual check 29 Oct 2026: correct paper',5,0)")
+    con.execute("INSERT INTO checks VALUES ('10.9999/d-4','mismatch','',5,0)")    # automatic result: checked again
+    con.commit()
+    assert sorted(d for d, *_ in F.papers_to_verify(con)) == ["10.9999/a-1", "10.9999/d-4"]
 
 
 def test_papers_no_source_can_handle_are_untouched():
@@ -280,7 +310,7 @@ def test_mark_incomplete_and_retry():
         run_fetcher(con, "incomplete", sources="elsevier", retry_incomplete=True)
     st = dict(con.execute("SELECT doi, status FROM papers"))
     assert st == {"10.1016/els-1": "done", "10.9999/x-2": "incomplete", "10.9999/x-3": "done"}, st
-    assert (out / f"{fn1}.pdf").exists() and (out / f"{marked1}.pdf").exists()   # notice is kept
+    assert (out / f"{fn1}.xml").exists() and (out / f"{marked1}.pdf").exists()   # notice is kept
     assert con.execute("SELECT source FROM papers WHERE doi='10.9999/x-2'").fetchone()[0] == "unpaywall"
     assert con.execute("SELECT COUNT(*) FROM checks WHERE doi='10.1016/els-1'").fetchone()[0] == 0  # re-check
 
