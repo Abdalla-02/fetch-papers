@@ -26,6 +26,7 @@ HITS = Counter()
 LEAKED = []
 API_QUOTA_AFTER = {"n": 10**9}   # the fake Unpaywall answers 429 + Retry-After after this many lookups
 LOOKUPS = {"n": 0}
+ELS_SERVED = {"n": 0, "max": 10**9}   # the fake Elsevier refuses everything (403) after this many full texts
 PDF_BYTES = b"%PDF-1.4\n" + b"x" * 5000
 _ELS = b'<?xml version="1.0"?><full-text-retrieval-response><coredata>' + b"x" * 2000 + b"</coredata>%s"
 ELS_FULL_TEXT = _ELS % b"<originalText><ce:sections><ce:para>Body</ce:para></ce:sections></originalText></full-text-retrieval-response>"
@@ -74,7 +75,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, PDF_BYTES, [("Content-Type", "application/pdf")])
         if kind == "els":                       # fake Elsevier Article Retrieval API (full text as XML)
             key = self.headers.get("X-ELS-APIKey")
+            if key == "good" and ("noacc" in path or ELS_SERVED["n"] >= ELS_SERVED["max"]):
+                return self.send(403, b"<service-error>AUTHENTICATION_ERROR</service-error>")   # no licence
             if key == "good":
+                ELS_SERVED["n"] += 1
                 body = ELS_ABSTRACT_ONLY if "abs" in path else ELS_NOTICE if "ntc" in path else ELS_FULL_TEXT
                 return self.send(200, body, [("Content-Type", "text/xml")])
             if key == "quota":
@@ -251,6 +255,33 @@ def test_wiley_prefixes_and_elsevier_xml():
         run_fetcher(con, "tdm_no_hindawi", sources="elsevier,wiley", wiley_prefixes="10.1002,10.1111")
         st = dict(con.execute("SELECT doi, status FROM papers"))
         assert st["10.1155/hin-1"] == "pending", st
+
+
+def test_tdm_api_not_skipped_for_articles_without_licence():
+    HITS.clear()
+    dois = ["10.1016/a-good-1"] + [f"10.1016/b-noacc-{n:02}" for n in range(12)] + ["10.1016/c-good-2"]
+    with env(ELSEVIER_API_KEY="good"):
+        # 12 articles without a licence in a row, but access as such works: Elsevier is not skipped
+        con = make_db("els_noacc", dois)
+        run_fetcher(con, "els_noacc", sources="elsevier", concurrency=1)
+        st = Counter(s for (s,) in con.execute("SELECT status FROM papers"))
+        assert st == {"done": 2, "failed": 12}, st
+        errs = {e for (e,) in con.execute("SELECT error FROM papers WHERE status='failed'")}
+        assert all("HTTP 403" in e and "skipped" not in e for e in errs), errs
+        assert HITS[("localhost", "els")] == 1 + 12 + 1 + 1, HITS       # one extra request: the access check
+        # access is gone after the first paper (e.g. VPN off): the check fails and Elsevier is skipped
+        HITS.clear()
+        ELS_SERVED.update(n=0, max=1)
+        try:
+            con = make_db("els_gone", dois)
+            run_fetcher(con, "els_gone", sources="elsevier", concurrency=1)
+        finally:
+            ELS_SERVED["max"] = 10**9
+        st = Counter(s for (s,) in con.execute("SELECT status FROM papers"))
+        assert st == {"done": 1, "failed": 13}, st
+        assert HITS[("localhost", "els")] == 1 + F.BLOCK_AFTER + 1, HITS
+        err = con.execute("SELECT error FROM papers WHERE doi='10.1016/a-good-1'").fetchone()[0]   # last (DOI order is descending)
+        assert "skipped" in err, err
 
 
 def test_elsevier_notice_xml_is_kept_as_notice():
