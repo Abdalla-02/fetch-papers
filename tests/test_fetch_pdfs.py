@@ -30,6 +30,9 @@ PDF_BYTES = b"%PDF-1.4\n" + b"x" * 5000
 _ELS = b'<?xml version="1.0"?><full-text-retrieval-response><coredata>' + b"x" * 2000 + b"</coredata>%s"
 ELS_FULL_TEXT = _ELS % b"<originalText><ce:sections><ce:para>Body</ce:para></ce:sections></originalText></full-text-retrieval-response>"
 ELS_ABSTRACT_ONLY = _ELS % b"</full-text-retrieval-response>"
+ELS_NOTICE = _ELS % (b"<originalText><ce:sections><ce:para>This article has been retracted: please see Elsevier Policy "
+                     b"on Article Withdrawal. The editor no longer has confidence in the data.</ce:para></ce:sections>"
+                     b"</originalText></full-text-retrieval-response>")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -72,7 +75,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if kind == "els":                       # fake Elsevier Article Retrieval API (full text as XML)
             key = self.headers.get("X-ELS-APIKey")
             if key == "good":
-                body = ELS_ABSTRACT_ONLY if "abs" in path else ELS_FULL_TEXT
+                body = ELS_ABSTRACT_ONLY if "abs" in path else ELS_NOTICE if "ntc" in path else ELS_FULL_TEXT
                 return self.send(200, body, [("Content-Type", "text/xml")])
             if key == "quota":
                 return self.send(429, b"quota exceeded")
@@ -248,6 +251,31 @@ def test_wiley_prefixes_and_elsevier_xml():
         run_fetcher(con, "tdm_no_hindawi", sources="elsevier,wiley", wiley_prefixes="10.1002,10.1111")
         st = dict(con.execute("SELECT doi, status FROM papers"))
         assert st["10.1155/hin-1"] == "pending", st
+
+
+def test_elsevier_notice_xml_is_kept_as_notice():
+    out = TMP / "els_notice"
+    con = make_db("els_notice", ["10.1016/ntc-1", "10.1016/ntc-2", "10.1016/els-3"])
+    fn2 = con.execute("SELECT filename FROM papers WHERE doi='10.1016/ntc-2'").fetchone()[0]
+    (out / fn2).parent.mkdir(parents=True, exist_ok=True)                 # paper 2 already has a notice PDF
+    (out / f"{F.marked_name(fn2, 'notice')}.pdf").write_bytes(PDF_BYTES)
+    con.execute("UPDATE papers SET status='incomplete', source='unpaywall' WHERE doi='10.1016/ntc-2'")
+    con.execute("INSERT INTO checks VALUES ('10.1016/ntc-2','notice','',1,0)")
+    con.commit()
+    with env(ELSEVIER_API_KEY="good"):
+        run_fetcher(con, "els_notice", sources="elsevier", retry_incomplete=True)
+    st = dict(con.execute("SELECT doi, status FROM papers"))
+    assert st == {"10.1016/ntc-1": "incomplete", "10.1016/ntc-2": "incomplete", "10.1016/els-3": "done"}, st
+    fn1 = con.execute("SELECT filename FROM papers WHERE doi='10.1016/ntc-1'").fetchone()[0]
+    assert (out / f"{F.marked_name(fn1, 'notice')}.xml").exists() and not (out / f"{fn1}.xml").exists()
+    assert con.execute("SELECT verdict FROM checks WHERE doi='10.1016/ntc-1'").fetchone()[0] == "notice"
+    # paper 2 keeps its notice PDF and its source; the second notice (XML) is not kept
+    assert con.execute("SELECT source FROM papers WHERE doi='10.1016/ntc-2'").fetchone()[0] == "unpaywall"
+    assert not list(out.rglob("000002*.xml")) and (out / f"{F.marked_name(fn2, 'notice')}.pdf").exists()
+    F.write_index(con, out)
+    index = (out / "index.csv").read_text(encoding="utf-8-sig")
+    assert "000001 [notice] - Title 1.xml" in index and "000002 [notice] - Title 2.pdf" in index
+    assert not F.xml_is_notice(ELS_FULL_TEXT.replace(b"<ce:para>Body", b"<ce:para>Body. " + b"word " * 1200))
 
 
 def test_verify_skips_manual_decisions_and_xml():

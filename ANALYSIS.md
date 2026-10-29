@@ -240,5 +240,6 @@ So 32 of the 54 suspicious files (59%) were a different document: an open-access
 | Wiley (10.1002) | 20 random missing papers | 14 full PDFs (6–22 pages, all checked OK); 4 Cochrane reviews refused (403); 2 not found (404), one of them because of a DOI escaping bug, now fixed |
 | Wiley for Hindawi (10.1155) | 2 random missing papers | 2 full PDFs |
 | Elsevier (10.1016) | 2 articles | full text as XML (body included); as a PDF only the first page |
+| Elsevier (10.1016), through the tool | 20 random missing papers | 15 complete articles (3,300–17,300 words, titles checked); 4 only the retraction notice (44–365 words), now kept as `[notice]` with status `incomplete`; 1 abstract only (not entitled) |
 
-Elsevier full texts are therefore saved as XML (structured full text, figures only referenced). With these results, about 14,900 Wiley/Hindawi papers and 8,100 Elsevier papers are reachable through the official APIs, about 36% of the list.
+Elsevier full texts are therefore saved as XML (structured full text, figures only referenced). For about one in five retracted Elsevier papers, Elsevier itself only provides the retraction notice, so these count as missing ("article not found" candidates). With these results, about 14,900 Wiley/Hindawi papers and 8,100 Elsevier papers are reachable through the official APIs, about 36% of the list.

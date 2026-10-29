@@ -66,6 +66,10 @@ WILEY_SKIP = ("10.1002/14651858.",)
 XML_SOURCES = ("elsevier",)
 # an Elsevier XML without one of these has only the abstract (no entitlement for the full text)
 ELSEVIER_FULLTEXT_MARKERS = (b"<ce:sections", b"<xocs:rawtext", b"<ce:para")
+# an XML full text this short that starts like a notice is only the retraction notice, not the article
+# (Phase B test: notices had 44-365 words, the real articles 3,300-17,300)
+XML_NOTICE_MAX_WORDS = 1000
+NOTICE_HINT = re.compile(r"has been retracted|withdrawn|retraction notice|notice of retraction", re.I)
 # the index/TDM APIs themselves (as opposed to publisher and repository sites)
 API_HOSTS = {urlparse(base).hostname for base in (UNPAYWALL, OPENALEX, ELSEVIER, WILEY, CROSSREF)}
 
@@ -156,6 +160,19 @@ def looks_like_pdf(first_bytes: bytes) -> bool:
 def looks_like_xml(first_bytes: bytes) -> bool:
     head = first_bytes[:1024].lstrip().lower()
     return head.startswith(b"<") and b"<html" not in head and b"<!doctype html" not in head
+
+
+def xml_text(data: bytes) -> str:
+    """Plain text of an Elsevier full-text XML: the raw text, or else the body sections."""
+    x = data.decode("utf-8", "replace")
+    m = (re.search(r"<xocs:rawtext[^>]*>(.*?)</xocs:rawtext>", x, re.S)
+         or re.search(r"<ce:sections>(.*)</ce:sections>", x, re.S))
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1))).strip() if m else ""
+
+
+def xml_is_notice(data: bytes) -> bool:
+    text = xml_text(data)
+    return len(text.split()) < XML_NOTICE_MAX_WORDS and bool(NOTICE_HINT.search(text[:600]))
 
 
 def file_ext(source: str | None) -> str:
@@ -505,23 +522,35 @@ class Fetcher:
             self.save(doi, "done", XML_SOURCES[0], None, None)
             return
         errors, tried, lookup_errors = [], set(), []
+        notice = None  # (source, url) of an XML that turned out to be only the retraction notice
         async for src, url, headers in self.candidates(client, doi, lookup_errors):
             if url in tried:
                 continue
             tried.add(url)
+            target = self.out / f"{filename}{file_ext(src)}"
             try:
-                err = await self.download(client, url, headers, self.out / f"{filename}{file_ext(src)}")
+                err = await self.download(client, url, headers, target)
             except StopRun:
                 raise
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
+            if err is None and src in XML_SOURCES and xml_is_notice(target.read_bytes()):
+                err = "XML is only the retraction notice, not the article"
+                if old_status == "incomplete" or notice:
+                    target.unlink()   # we already have a notice for this paper; this new file adds nothing
+                else:                 # keep it like a notice PDF: '<RW ID> [notice] - <title>.xml'
+                    os.replace(target, self.out / f"{marked_name(filename, 'notice')}{file_ext(src)}")
+                    notice = (src, url)
             if err is None:
                 self.save(doi, "done", src, url, None)
                 self.stats[f"done_{src}"] += 1
                 return
             errors.append(f"{src}: {err} <{url[:120]}>")
         errors += lookup_errors
-        if old_status == "incomplete":
+        if notice:
+            self.save_notice(doi, *notice, " | ".join(errors)[:2000])
+            self.stats["notice_only"] += 1
+        elif old_status == "incomplete":
             # we still have the notice / first page: keep that status, just note why this try failed
             self.save(doi, "incomplete", None, None,
                       (" | ".join(errors) or "no PDF link found in any source")[:2000])
@@ -546,6 +575,15 @@ class Fetcher:
         )
         if status == "done" and source != "already_on_disk":  # new file -> old check result is stale
             self.con.execute("DELETE FROM checks WHERE doi=?", (doi,))
+        self.con.commit()
+
+    def save_notice(self, doi, source, url, error):
+        """The publisher's full text is only the retraction notice: the paper becomes 'incomplete'
+        (like a notice PDF after 'mark-incomplete'), so the real article is still counted as missing."""
+        self.con.execute("UPDATE papers SET status='incomplete', source=?, pdf_url=?, error=?, "
+                         "attempts=attempts+1, updated=? WHERE doi=?", (source, url, error, time.time(), doi))
+        self.con.execute("INSERT OR REPLACE INTO checks VALUES (?,?,?,?,?)",
+                         (doi, "notice", f"{source} full text is only the retraction notice", 0, time.time()))
         self.con.commit()
 
     def progress(self, n_done, n_total):
@@ -918,7 +956,7 @@ def check_pdf_folder(con, out: Path, args):
     it cannot see, and 'verify' / 'mark-incomplete' would report nonsense. --skip-folder-check overrides."""
     if getattr(args, "skip_folder_check", False):
         return
-    expected = [marked_name(fn, v) + ".pdf" if status == "incomplete" else fn + file_ext(src)
+    expected = [(marked_name(fn, v) if status == "incomplete" else fn) + file_ext(src)
                 for fn, status, v, src in con.execute(
                     "SELECT filename, status, c.verdict, p.source FROM papers p LEFT JOIN checks c ON c.doi = p.doi "
                     "WHERE p.status IN ('done', 'incomplete')")]
