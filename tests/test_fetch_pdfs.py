@@ -29,11 +29,16 @@ LOOKUPS = {"n": 0}
 ELS_SERVED = {"n": 0, "max": 10**9}   # the fake Elsevier refuses everything (403) after this many full texts
 PDF_BYTES = b"%PDF-1.4\n" + b"x" * 5000
 _ELS = b'<?xml version="1.0"?><full-text-retrieval-response><coredata>' + b"x" * 2000 + b"</coredata>%s"
-ELS_FULL_TEXT = _ELS % b"<originalText><ce:sections><ce:para>Body</ce:para></ce:sections></originalText></full-text-retrieval-response>"
+ELS_FULL_TEXT = _ELS % (b"<originalText><ce:sections><ce:para>Body " + b"word " * 500 +
+                        b"</ce:para></ce:sections></originalText></full-text-retrieval-response>")
 ELS_ABSTRACT_ONLY = _ELS % b"</full-text-retrieval-response>"
 ELS_NOTICE = _ELS % (b"<originalText><ce:sections><ce:para>This article has been retracted: please see Elsevier Policy "
                      b"on Article Withdrawal. The editor no longer has confidence in the data.</ce:para></ce:sections>"
                      b"</originalText></full-text-retrieval-response>")
+ELS_REMOVED = _ELS % (b"<originalText><xocs:doc><xocs:rawtext>REMOVED: A title Some Author, Some University. This article "
+                      b"has been removed at the request of the editor.</xocs:rawtext></xocs:doc></originalText></full-text-retrieval-response>")
+ELS_SHORT = _ELS % (b"<originalText><xocs:doc><xocs:rawtext>Journal Pre-proof A title Some Author PII: S0000 DOI: 10.1016/x "
+                    b"To appear in: A Journal</xocs:rawtext></xocs:doc></originalText></full-text-retrieval-response>")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -79,7 +84,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(403, b"<service-error>AUTHENTICATION_ERROR</service-error>")   # no licence
             if key == "good":
                 ELS_SERVED["n"] += 1
-                body = ELS_ABSTRACT_ONLY if "abs" in path else ELS_NOTICE if "ntc" in path else ELS_FULL_TEXT
+                body = (ELS_ABSTRACT_ONLY if "abs" in path else ELS_NOTICE if "ntc" in path
+                        else ELS_SHORT if "shrt" in path else ELS_FULL_TEXT)
                 return self.send(200, body, [("Content-Type", "text/xml")])
             if key == "quota":
                 return self.send(429, b"quota exceeded")
@@ -87,8 +93,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if kind == "wiley":                     # fake Wiley TDM API
             if "%25" in self.path:              # a '%' escaped twice: no such article
                 return self.send(404)
-            if "14651858" in path:              # Cochrane reviews are not covered by the licence
+            if "14651858" in path or "nolic" in path:   # Cochrane reviews / articles without a licence
                 return self.send(403, b"not entitled")
+            if "redir" in path and self.headers.get("Wiley-TDM-Client-Token") == "good":
+                return self.send(302, headers=[("Location", f"http://127.0.0.1:{PORT}/good/w")])   # like the real API
             if self.headers.get("Wiley-TDM-Client-Token") == "good":
                 return self.send(200, PDF_BYTES, [("Content-Type", "application/pdf")])
             return self.send(403, b"not entitled")
@@ -306,7 +314,52 @@ def test_elsevier_notice_xml_is_kept_as_notice():
     F.write_index(con, out)
     index = (out / "index.csv").read_text(encoding="utf-8-sig")
     assert "000001 [notice] - Title 1.xml" in index and "000002 [notice] - Title 2.pdf" in index
-    assert not F.xml_is_notice(ELS_FULL_TEXT.replace(b"<ce:para>Body", b"<ce:para>Body. " + b"word " * 1200))
+    assert F.xml_verdict(ELS_FULL_TEXT)[0] == "ok"
+    assert F.xml_verdict(ELS_NOTICE)[0] == "notice" and F.xml_verdict(ELS_REMOVED)[0] == "notice"
+    assert F.xml_verdict(ELS_SHORT)[0] == "short_text"
+    squashed = ELS_SHORT.replace(b"To appear in: A Journal", b"Thewholearticlewithoutspaces" * 100)   # few words, much text
+    assert F.xml_verdict(squashed)[0] == "ok"
+
+
+def test_short_xml_is_kept_as_short_and_old_xml_can_be_verified():
+    out = TMP / "short_xml"
+    with env(ELSEVIER_API_KEY="good"):
+        con = make_db("short_xml", ["10.1016/shrt-1", "10.1016/els-2"])
+        run_fetcher(con, "short_xml", sources="elsevier")
+    st = dict(con.execute("SELECT doi, status FROM papers"))
+    assert st == {"10.1016/shrt-1": "incomplete", "10.1016/els-2": "done"}, st
+    fn1 = con.execute("SELECT filename FROM papers WHERE doi='10.1016/shrt-1'").fetchone()[0]
+    assert F.marked_name(fn1, "short_text").endswith("000001 [short] - Title 1")
+    assert (out / f"{F.marked_name(fn1, 'short_text')}.xml").exists() and not (out / f"{fn1}.xml").exists()
+    assert con.execute("SELECT verdict FROM checks WHERE doi='10.1016/shrt-1'").fetchone()[0] == "short_text"
+    # an XML saved by an older version: 'verify' finds it, 'mark-incomplete' keeps it as '[short]'
+    fn2 = con.execute("SELECT filename FROM papers WHERE doi='10.1016/els-2'").fetchone()[0]
+    (out / f"{fn2}.xml").write_bytes(ELS_SHORT)
+    assert [d for d, *_ in F.xml_to_verify(con)] == ["10.1016/els-2"]
+    r = F.verify_xml(out / f"{fn2}.xml")
+    assert r["verdict"] == "short_text" and "words" in r["note"], r
+    con.execute("INSERT INTO checks VALUES ('10.1016/els-2', 'short_text', ?, 0, 0)", (r["note"],))
+    con.commit()
+    args = types.SimpleNamespace(db=str(TMP / "short_xml.sqlite"), out=str(out), dry_run=False, skip_folder_check=True)
+    F.cmd_mark_incomplete(args)
+    assert con.execute("SELECT status FROM papers WHERE doi='10.1016/els-2'").fetchone()[0] == "incomplete"
+    assert (out / f"{F.marked_name(fn2, 'short_text')}.xml").exists() and not (out / f"{fn2}.xml").exists()
+
+
+def test_wiley_redirects_count_as_success_for_the_api():
+    # the real Wiley API answers every PDF with a redirect to another host; single 403s (articles without a
+    # licence) in between must not add up to "8 in a row", and a run of them is checked with a paper that worked
+    HITS.clear()
+    alternating = [f"10.1002/x{n:02}a-nolic" for n in range(10)] + [f"10.1002/x{n:02}b-redir" for n in range(10)]
+    run_of_refusals = ["10.1002/y-redir-1"] + [f"10.1002/w-nolic-{n:02}" for n in range(10)] + ["10.1002/a-redir-2"]
+    with env(WILEY_TDM_TOKEN="good"):
+        for name, dois in (("wiley_alt", alternating), ("wiley_run", run_of_refusals)):
+            con = make_db(name, dois)
+            run_fetcher(con, name, sources="wiley", concurrency=1)
+            st = Counter(s for (s,) in con.execute("SELECT status FROM papers"))
+            assert st == {"failed": 10, "done": len(dois) - 10}, (name, st)
+            errs = [e for (e,) in con.execute("SELECT error FROM papers WHERE status='failed'")]
+            assert all("HTTP 403" in e and "skipped" not in e for e in errs), (name, errs)
 
 
 def test_verify_skips_manual_decisions_and_xml():

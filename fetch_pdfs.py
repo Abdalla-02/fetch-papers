@@ -69,7 +69,13 @@ ELSEVIER_FULLTEXT_MARKERS = (b"<ce:sections", b"<xocs:rawtext", b"<ce:para")
 # an XML full text this short that starts like a notice is only the retraction notice, not the article
 # (Phase B test: notices had 44-365 words, the real articles 3,300-17,300)
 XML_NOTICE_MAX_WORDS = 1000
-NOTICE_HINT = re.compile(r"has been retracted|withdrawn|retraction notice|notice of retraction", re.I)
+NOTICE_HINT = re.compile(r"has been retracted|withdrawn|retraction notice|notice of retraction|"
+                         r"has been removed|\bremoved\s*:|\bretrait\s*:", re.I)
+# An Elsevier XML "full text" with less text than this is not the article either, e.g. the cover page of a
+# "Journal Pre-proof" or a single fragment. Characters, not words: some raw texts have no spaces between words.
+XML_MIN_CHARS = 2000
+XML_PROBLEMS = {"notice": "XML is only the retraction notice, not the article",
+                "short_text": "XML has too little text to be the article (e.g. a pre-proof cover page)"}
 # the index/TDM APIs themselves (as opposed to publisher and repository sites)
 API_HOSTS = {urlparse(base).hostname for base in (UNPAYWALL, OPENALEX, ELSEVIER, WILEY, CROSSREF)}
 
@@ -176,9 +182,16 @@ def xml_text(data: bytes) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1))).strip() if m else ""
 
 
-def xml_is_notice(data: bytes) -> bool:
+def xml_verdict(data: bytes) -> tuple[str, int]:
+    """Is an Elsevier full-text XML really the article? Returns ('ok' | 'notice' | 'short_text', words).
+    'notice': short and starts like a retraction / removal notice; 'short_text': too little text (XML_MIN_CHARS)."""
     text = xml_text(data)
-    return len(text.split()) < XML_NOTICE_MAX_WORDS and bool(NOTICE_HINT.search(text[:600]))
+    words = len(text.split())
+    if words < XML_NOTICE_MAX_WORDS and NOTICE_HINT.search(text[:600]):
+        return "notice", words
+    if len(text) < XML_MIN_CHARS:
+        return "short_text", words
+    return "ok", words
 
 
 def file_ext(source: str | None) -> str:
@@ -408,6 +421,8 @@ class Fetcher:
                               f"run the same command again later")
             if resp.status_code < 400:
                 self.limiter.ok(final)
+                if urlparse(url).hostname != host:   # e.g. the Wiley API redirects every PDF to another host
+                    self.limiter.ok(url)
             return resp
         return resp
 
@@ -518,10 +533,11 @@ class Fetcher:
             if xml and not any(m in tmp.read_bytes() for m in ELSEVIER_FULLTEXT_MARKERS):
                 return "XML has no full text, only the abstract (not entitled?)"
             os.replace(tmp, dest)
-            host = urlparse(final).hostname or ""
-            self.limiter.refusals[host] = 0
-            if host in TDM_HOSTS:
-                self.last_ok[host] = (url, h)
+            asked = urlparse(url).hostname or ""   # the API; `final` may be the host it redirected to
+            for host in {asked, urlparse(final).hostname or ""}:
+                self.limiter.refusals[host] = 0
+            if asked in TDM_HOSTS:
+                self.last_ok[asked] = (url, h)
             return None
         finally:
             await r.aclose()
@@ -557,7 +573,7 @@ class Fetcher:
             self.save(doi, "done", XML_SOURCES[0], None, None)
             return
         errors, tried, lookup_errors = [], set(), []
-        notice = None  # (source, url) of an XML that turned out to be only the retraction notice
+        notice = None  # (source, url, verdict) of an XML that turned out not to be the article (see xml_verdict)
         async for src, url, headers in self.candidates(client, doi, lookup_errors):
             if url in tried:
                 continue
@@ -569,13 +585,14 @@ class Fetcher:
                 raise
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
-            if err is None and src in XML_SOURCES and xml_is_notice(target.read_bytes()):
-                err = "XML is only the retraction notice, not the article"
+            verdict = xml_verdict(target.read_bytes())[0] if err is None and src in XML_SOURCES else "ok"
+            if verdict != "ok":
+                err = XML_PROBLEMS[verdict]
                 if old_status == "incomplete" or notice:
                     target.unlink()   # we already have a notice for this paper; this new file adds nothing
-                else:                 # keep it like a notice PDF: '<RW ID> [notice] - <title>.xml'
-                    os.replace(target, self.out / f"{marked_name(filename, 'notice')}{file_ext(src)}")
-                    notice = (src, url)
+                else:                 # keep it like a notice PDF: '<RW ID> [notice] - <title>.xml' / '[short]'
+                    os.replace(target, self.out / f"{marked_name(filename, verdict)}{file_ext(src)}")
+                    notice = (src, url, verdict)
             if err is None:
                 self.save(doi, "done", src, url, None)
                 self.stats[f"done_{src}"] += 1
@@ -612,13 +629,13 @@ class Fetcher:
             self.con.execute("DELETE FROM checks WHERE doi=?", (doi,))
         self.con.commit()
 
-    def save_notice(self, doi, source, url, error):
-        """The publisher's full text is only the retraction notice: the paper becomes 'incomplete'
-        (like a notice PDF after 'mark-incomplete'), so the real article is still counted as missing."""
+    def save_notice(self, doi, source, url, verdict, error):
+        """The publisher's full text is only the retraction notice (or too short to be the article): the paper
+        becomes 'incomplete' (like a notice PDF after 'mark-incomplete'), so the real article is still counted as missing."""
         self.con.execute("UPDATE papers SET status='incomplete', source=?, pdf_url=?, error=?, "
                          "attempts=attempts+1, updated=? WHERE doi=?", (source, url, error, time.time(), doi))
         self.con.execute("INSERT OR REPLACE INTO checks VALUES (?,?,?,?,?)",
-                         (doi, "notice", f"{source} full text is only the retraction notice", 0, time.time()))
+                         (doi, verdict, f"{source}: {XML_PROBLEMS[verdict]}", 0, time.time()))
         self.con.commit()
 
     def progress(self, n_done, n_total):
@@ -792,9 +809,9 @@ REASONS = ["closed access (no open-access copy)", "blocked by bot protection (Cl
            "broken link (HTTP 404/410)", "index lookup error (worth retrying)", "other",
            "PDF is only a retraction notice or first page"]
 # 'verify' verdicts meaning the downloaded PDF is not the full article
-INCOMPLETE_VERDICTS = ("notice", "short")
+INCOMPLETE_VERDICTS = ("notice", "short", "short_text")
 # 'mark-incomplete' keeps such a file under a marked name, e.g. '001454 [notice] - Title.pdf'
-MARK_LABELS = {"notice": "notice", "short": "first page"}
+MARK_LABELS = {"notice": "notice", "short": "first page", "short_text": "short"}
 
 
 def marked_name(filename: str, verdict: str | None) -> str:
@@ -919,7 +936,7 @@ VERIFY_PAGES = 3          # pages read from the start of each PDF
 LONG_PDF_PAGES = 60       # longer than this: probably a whole issue / supplement
 STOPWORDS = set("with from that this their between among into using based study analysis effect effects "
                 "role during after under over versus which through".split())
-VERDICT_ORDER = ["unreadable", "mismatch", "notice", "short", "check", "no_text", "ok"]
+VERDICT_ORDER = ["unreadable", "mismatch", "notice", "short", "short_text", "check", "no_text", "ok"]
 # wording of retraction notices / notes (a "RETRACTED" watermark on a real article does not match)
 NOTICE_RE = re.compile(r"\bretraction\b|\bhas been retracted\b|\bwas retracted\b|\bis retracted\b|"
                        r"\bhas been withdrawn\b|\bwas withdrawn\b|\bis withdrawn\b|\bwithdrawal\b|"
@@ -1009,7 +1026,7 @@ MANUAL_CHECK = "manual check"   # a 'checks' note starting with this is a person
 
 
 def papers_to_verify(con) -> list:
-    """Downloaded PDFs to check. Left out: XML full texts (checked for a body when downloaded) and
+    """Downloaded PDFs to check. Left out: XML full texts (see xml_to_verify) and
     PDFs a person has already looked at (check note 'manual check ...'), so 'verify' never
     overwrites their decision. A new download of the paper clears the note (see Fetcher.save)."""
     return con.execute(
@@ -1018,9 +1035,26 @@ def papers_to_verify(con) -> list:
         "AND COALESCE(c.note, '') NOT LIKE ?", [*XML_SOURCES, MANUAL_CHECK + "%"]).fetchall()
 
 
+def xml_to_verify(con) -> list:
+    """Downloaded XML full texts to check with xml_verdict (same columns as papers_to_verify)."""
+    return con.execute(
+        "SELECT p.doi, record_ids, title, filename FROM papers p LEFT JOIN checks c ON c.doi = p.doi "
+        f"WHERE p.status='done' AND p.source IN ({','.join('?' * len(XML_SOURCES))}) "
+        "AND COALESCE(c.note, '') NOT LIKE ?", [*XML_SOURCES, MANUAL_CHECK + "%"]).fetchall()
+
+
+def verify_xml(path: Path) -> dict:
+    """Check result for an XML full text, in the same form as verify_pdf."""
+    r = {"pages": 0, "title_match": "", "doi_in_pdf": ""}
+    if not path.exists():
+        return {**r, "verdict": "unreadable", "note": "file not found"}
+    verdict, words = xml_verdict(path.read_bytes())
+    return {**r, "verdict": verdict, "note": f"XML full text, {words} words"}
+
+
 def cmd_verify(args):
-    """Check every downloaded PDF against its title and DOI; write <out-dir>/verify.csv.
-    PDFs with a manual decision and XML full texts are not checked again (see papers_to_verify)."""
+    """Check every downloaded PDF against its title and DOI, and every XML full text for its length
+    (xml_verdict); write <out-dir>/verify.csv. Files with a manual decision are not checked again."""
     import importlib.util
     if importlib.util.find_spec("pypdf") is None:
         sys.exit("verify needs pypdf:  pip install pypdf cryptography")
@@ -1029,12 +1063,12 @@ def cmd_verify(args):
     out, rep = Path(args.out), Path(args.out_dir)
     check_pdf_folder(con, out, args)
     rep.mkdir(parents=True, exist_ok=True)
-    papers = papers_to_verify(con)
-    skipped = con.execute("SELECT COUNT(*) FROM papers WHERE status='done'").fetchone()[0] - len(papers)
+    papers, xmls = papers_to_verify(con), xml_to_verify(con)
+    skipped = con.execute("SELECT COUNT(*) FROM papers WHERE status='done'").fetchone()[0] - len(papers) - len(xmls)
     if args.limit:
-        papers = papers[:args.limit]
-    print(f"checking {len(papers)} PDFs with {args.workers} processes "
-          f"({skipped} skipped: XML full texts or decided by hand) ...", flush=True)
+        papers, xmls = papers[:args.limit], xmls[:args.limit]
+    print(f"checking {len(papers)} PDFs with {args.workers} processes and {len(xmls)} XML full texts "
+          f"({skipped} skipped: decided by hand) ...", flush=True)
     results = []
     with ProcessPoolExecutor(args.workers) as pool:
         jobs = [(p, pool.submit(verify_pdf, str(out / f"{p[3]}.pdf"), p[2] or "", p[0])) for p in papers]
@@ -1047,6 +1081,8 @@ def cmd_verify(args):
             results.append((p, r))
             if i % 500 == 0:
                 print(f"  {i}/{len(papers)}", flush=True)
+    results += [(p, verify_xml(out / f"{p[3]}.xml")) for p in xmls]
+    xml_dois = {p[0] for p in xmls}
     results.sort(key=lambda x: (VERDICT_ORDER.index(x[1]["verdict"]), first_id(x[0][1])))
     with con:  # keep the verdicts, so index.csv and summary can use them
         con.executemany("INSERT OR REPLACE INTO checks VALUES (?,?,?,?,?)",
@@ -1057,9 +1093,10 @@ def cmd_verify(args):
                      "title_match", "doi_in_pdf", "size_kb"])
         for (doi, ids, title, fn), r in results:
             folder, _, name = fn.rpartition("/")
-            path = out / f"{fn}.pdf"
+            ext = ".xml" if doi in xml_dois else ".pdf"
+            path = out / f"{fn}{ext}"
             size = path.stat().st_size // 1024 if path.exists() else ""
-            w.writerow([r["verdict"], r["note"], first_id(ids), doi, title, folder, f"{name}.pdf",
+            w.writerow([r["verdict"], r["note"], first_id(ids), doi, title, folder, f"{name}{ext}",
                         r["pages"], r["title_match"], r["doi_in_pdf"], size])
     counts = defaultdict(int)
     for _, r in results:
@@ -1082,23 +1119,24 @@ def cmd_verify(args):
 
 
 def cmd_mark_incomplete(args):
-    """Keep PDFs that 'verify' found to be only a notice / first page under a marked name
-    ('<RW ID> [notice] - <title>.pdf', '<RW ID> [first page] - <title>.pdf') and set their papers to status 'incomplete',
+    """Keep files that 'verify' found to be only a notice / first page / too short under a marked name
+    ('<RW ID> [notice] - <title>.pdf', '[first page]', '[short]' for XML) and set their papers to status 'incomplete',
     so a later run with --retry-incomplete can fetch the real article. Never deletes anything."""
     con = open_db(args.db)
     out = Path(args.out)
     check_pdf_folder(con, out, args)
-    rows = con.execute("SELECT p.doi, p.filename, c.verdict FROM papers p JOIN checks c ON c.doi = p.doi "
+    rows = con.execute("SELECT p.doi, p.filename, c.verdict, p.source FROM papers p JOIN checks c ON c.doi = p.doi "
                        f"WHERE p.status='done' AND c.verdict IN ({','.join('?' * len(MARK_LABELS))})",
                        list(MARK_LABELS)).fetchall()
-    plan = [(doi, out / f"{fn}.pdf", out / f"{marked_name(fn, v)}.pdf", v) for doi, fn, v in rows]
+    plan = [(doi, out / f"{fn}{file_ext(src)}", out / f"{marked_name(fn, v)}{file_ext(src)}", v)
+            for doi, fn, v, src in rows]
     missing = [p for p in plan if not p[1].exists()]
     clash = [p for p in plan if p[2].exists()]
     plan = [p for p in plan if p not in missing and p not in clash]
     counts = defaultdict(int)
     for p in plan:
         counts[p[3]] += 1
-    print(f"{len(plan)} PDFs to mark: " + ", ".join(f"{n} as [{MARK_LABELS[v]}]" for v, n in counts.items()))
+    print(f"{len(plan)} files to mark: " + ", ".join(f"{n} as [{MARK_LABELS[v]}]" for v, n in counts.items()))
     for _, src, dst, _ in plan[:5]:
         print(f"  {src.parent.name}/{src.name[:70]}\n   -> {dst.parent.name}/{dst.name[:70]}")
     if plan:
@@ -1121,7 +1159,7 @@ def cmd_mark_incomplete(args):
     with con:
         con.executemany("UPDATE papers SET status='incomplete', updated=? WHERE doi=?",
                         [(time.time(), doi) for doi, *_ in plan])
-    print(f"marked {len(done)} PDFs; their papers now have status 'incomplete' "
+    print(f"marked {len(done)} files; their papers now have status 'incomplete' "
           f"(fetch the real article later with: run ... --retry-incomplete)")
     write_index(con, out)
 
