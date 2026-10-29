@@ -88,6 +88,12 @@ DEFAULT_RPS = 0.5  # = one request every 2 s per publisher/repository host
 # page instead of a PDF) without a single success is skipped for the rest of the run.
 # Its papers end up as 'failed' and can be retried later with --retry-failed.
 BLOCK_AFTER = 8
+# On the publisher TDM APIs a 403 usually means "no licence for this article" (e.g. a journal the
+# university doesn't subscribe to), and such papers come in runs because they are processed in DOI
+# order. Before one of these hosts is skipped, a paper that worked earlier in the run is requested
+# once more: if it still works, the refusals were single articles and the run goes on; if not
+# (key revoked, VPN off), the host is skipped as before.
+TDM_HOSTS = {urlparse(base).hostname for base in (ELSEVIER, WILEY)}
 # A host that asks (Retry-After) for a longer pause than this is skipped for the rest of the run
 # instead of holding up all its papers.
 MAX_RETRY_AFTER = 120
@@ -338,6 +344,8 @@ class Fetcher:
         self.stats = defaultdict(int)
         self.t0 = time.time()
         self.stop_reason = ""  # set when an API asks for a long pause (StopRun)
+        self.last_ok: dict[str, tuple[str, dict]] = {}  # TDM host -> (url, headers) of a paper that worked
+        self.access_noted: set[str] = set()
 
     # -- HTTP with retries -------------------------------------------------
     async def send(self, client, url, headers, stream, max_hops=10):
@@ -482,7 +490,12 @@ class Fetcher:
                 else:
                     err = f"HTTP {r.status_code}"
                 if r.status_code in (401, 403, 429):
-                    self.limiter.refused(final, err)
+                    host = urlparse(final).hostname or ""
+                    if (r.status_code == 403 and self.limiter.refusals[host] + 1 >= BLOCK_AFTER
+                            and await self.access_still_works(client, host)):
+                        self.limiter.refusals[host] = 0
+                    else:
+                        self.limiter.refused(final, err)
                 return err + via
             size, first = 0, b""
             dest.parent.mkdir(parents=True, exist_ok=True)  # ID-block subfolder
@@ -505,12 +518,34 @@ class Fetcher:
             if xml and not any(m in tmp.read_bytes() for m in ELSEVIER_FULLTEXT_MARKERS):
                 return "XML has no full text, only the abstract (not entitled?)"
             os.replace(tmp, dest)
-            self.limiter.refusals[urlparse(final).hostname or ""] = 0
+            host = urlparse(final).hostname or ""
+            self.limiter.refusals[host] = 0
+            if host in TDM_HOSTS:
+                self.last_ok[host] = (url, h)
             return None
         finally:
             await r.aclose()
             if tmp.exists():
                 tmp.unlink()
+
+    async def access_still_works(self, client, host) -> bool:
+        """A TDM API refused BLOCK_AFTER papers in a row: request a paper that worked earlier in this run.
+        True = access as such still works, the refusals were articles without a licence."""
+        if host not in TDM_HOSTS or host not in self.last_ok:
+            return False
+        url, headers = self.last_ok[host]
+        try:
+            r = await self.request(client, url, headers=headers, stream=True)
+        except (HostBlocked, httpx.HTTPError):
+            return False
+        await r.aclose()
+        if r.status_code != 200:
+            return False
+        if host not in self.access_noted:
+            self.access_noted.add(host)
+            print(f"  {host} refused {BLOCK_AFTER} papers in a row, but a paper that worked before still "
+                  f"works: no licence for those articles, going on", file=sys.stderr, flush=True)
+        return True
 
     async def process(self, client, doi, filename, old_status="pending"):
         dest = self.out / f"{filename}.pdf"
