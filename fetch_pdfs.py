@@ -103,6 +103,12 @@ TDM_HOSTS = {urlparse(base).hostname for base in (ELSEVIER, WILEY)}
 # A host that asks (Retry-After) for a longer pause than this is skipped for the rest of the run
 # instead of holding up all its papers.
 MAX_RETRY_AFTER = 120
+# A file error while handling one paper (e.g. Nextcloud's virtual-files driver not answering in time,
+# WinError 426) leaves that paper as it was and the run goes on; this many such errors in a row stop the run.
+FS_ERRORS_STOP = 20
+# Sources whose files come from the publisher's own TDM API: if such an API sent only the notice, asking it
+# again sends the same notice, so --retry-incomplete leaves these papers out when that source is used.
+TDM_SOURCES = ("elsevier", "wiley")
 
 MAX_PDF_BYTES = 300 * 1024 * 1024
 TIMEOUT = httpx.Timeout(60.0, connect=20.0)
@@ -359,6 +365,7 @@ class Fetcher:
         self.stop_reason = ""  # set when an API asks for a long pause (StopRun)
         self.last_ok: dict[str, tuple[str, dict]] = {}  # TDM host -> (url, headers) of a paper that worked
         self.access_noted: set[str] = set()
+        self.fs_errors = 0  # file errors in a row (see FS_ERRORS_STOP)
 
     # -- HTTP with retries -------------------------------------------------
     async def send(self, client, url, headers, stream, max_hops=10):
@@ -465,12 +472,9 @@ class Fetcher:
                                 yield "openalex", u, None
                 elif src == "elsevier" and self.els_key and doi.startswith("10.1016/"):
                     # full text as XML: as a PDF the API only sends the first page
-                    h = {"X-ELS-APIKey": self.els_key, "Accept": "text/xml"}
-                    if self.els_inst:
-                        h["X-ELS-Insttoken"] = self.els_inst
-                    yield "elsevier", f"{ELSEVIER}/content/article/doi/{doi}?view=FULL", h
+                    yield "elsevier", f"{ELSEVIER}/content/article/doi/{doi}?view=FULL", self.tdm_headers(src)
                 elif src == "wiley" and self.wiley_handles(doi):
-                    yield "wiley", f"{WILEY}/onlinelibrary/tdm/v1/articles/{q}", {"Wiley-TDM-Client-Token": self.wiley_tok}
+                    yield "wiley", f"{WILEY}/onlinelibrary/tdm/v1/articles/{q}", self.tdm_headers(src)
                 elif src == "crossref":
                     j = await self.get_json(client, f"{CROSSREF}/works/{q}?mailto={quote(self.a.email)}")
                     for link in ((j or {}).get("message", {}).get("link") or []):
@@ -544,12 +548,32 @@ class Fetcher:
             if tmp.exists():
                 tmp.unlink()
 
+    def tdm_headers(self, src) -> dict:
+        if src == "elsevier":
+            h = {"X-ELS-APIKey": self.els_key, "Accept": "text/xml"}
+            if self.els_inst:
+                h["X-ELS-Insttoken"] = self.els_inst
+            return h
+        return {"Wiley-TDM-Client-Token": self.wiley_tok}
+
+    def earlier_success(self, host):
+        """(url, headers) of a paper this API delivered in an earlier run. A restarted run retries the old
+        failures (mostly 403: no licence) first, so its first BLOCK_AFTER papers may all be refused."""
+        for src in TDM_SOURCES:
+            for (url,) in self.con.execute("SELECT pdf_url FROM papers WHERE status='done' AND source=? "
+                                           "ORDER BY updated DESC LIMIT 20", (src,)):
+                if url and urlparse(url).hostname == host:
+                    return url, self.tdm_headers(src)
+        return None
+
     async def access_still_works(self, client, host) -> bool:
-        """A TDM API refused BLOCK_AFTER papers in a row: request a paper that worked earlier in this run.
-        True = access as such still works, the refusals were articles without a licence."""
-        if host not in TDM_HOSTS or host not in self.last_ok:
+        """A TDM API refused BLOCK_AFTER papers in a row: request a paper that worked earlier in this run
+        (or, if none has yet, in an earlier run). True = access as such still works, the refusals were
+        articles without a licence."""
+        known = (self.last_ok.get(host) or self.earlier_success(host)) if host in TDM_HOSTS else None
+        if not known:
             return False
-        url, headers = self.last_ok[host]
+        url, headers = known
         try:
             r = await self.request(client, url, headers=headers, stream=True)
         except (HostBlocked, httpx.HTTPError):
@@ -667,7 +691,7 @@ class Fetcher:
         statuses = ["pending"] + (["failed"] if retry_failed else []) \
                    + (["not_found"] if self.a.retry_not_found else []) \
                    + (["incomplete"] if getattr(self.a, "retry_incomplete", False) else [])
-        sql =f"SELECT doi, filename, status, error FROM papers WHERE status IN ({','.join('?'*len(statuses))})"
+        sql =f"SELECT doi, filename, status, error, source FROM papers WHERE status IN ({','.join('?'*len(statuses))})"
         params = list(statuses)
         if self.a.prefix:
             sql += " AND doi LIKE ?"
@@ -676,7 +700,14 @@ class Fetcher:
         if self.a.retry_temporary and not self.a.retry_failed:
             # only failures that may go away by themselves (timeouts, 5xx ...), not blocked sites
             rows = [r for r in rows if r[2] != "failed" or classify(r[2], r[3]) in TEMPORARY_REASONS]
-        todo = [(doi, fn, status) for doi, fn, status, _ in rows if self.can_handle(doi)]
+        def notice_from_this_api(r):
+            return r[2] == "incomplete" and r[4] in TDM_SOURCES and r[4] in self.sources
+        same_api = [r for r in rows if notice_from_this_api(r)]
+        if same_api:
+            print(f"{len(same_api)} incomplete paper(s) left untouched: their notice came from the same "
+                  f"publisher API ({', '.join(sorted({r[4] for r in same_api}))}), asking again gives the same file")
+            rows = [r for r in rows if not notice_from_this_api(r)]
+        todo = [(doi, fn, status) for doi, fn, status, *_ in rows if self.can_handle(doi)]
         if len(todo) < len(rows):
             print(f"{len(rows) - len(todo)} paper(s) left untouched: none of the sources "
                   f"({', '.join(self.sources)}) can handle them with the keys that are set")
@@ -718,9 +749,18 @@ class Fetcher:
                         return
                     try:
                         await self.process(client, doi, fn, old_status)
+                        self.fs_errors = 0
                     except StopRun as e:  # this paper is not saved, so it keeps its old status
                         self.stop_reason = self.stop_reason or str(e)
                         return
+                    except OSError as e:  # e.g. the cloud folder timed out: this paper keeps its old status
+                        self.fs_errors += 1
+                        self.stats["file_error"] += 1
+                        print(f"  ! {doi}: file error, paper left as it was: {e}", file=sys.stderr, flush=True)
+                        if self.fs_errors >= FS_ERRORS_STOP:
+                            self.stop_reason = self.stop_reason or (
+                                f"{FS_ERRORS_STOP} file errors in a row - is the PDF folder reachable? (last: {e})")
+                            return
                     done += 1
                     if done % self.a.progress_every == 0 or done == total:
                         self.progress(done, total)
