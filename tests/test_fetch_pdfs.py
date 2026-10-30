@@ -292,6 +292,23 @@ def test_tdm_api_not_skipped_for_articles_without_licence():
         assert "skipped" in err, err
 
 
+
+def test_restart_starting_with_refusals_checks_access_with_an_earlier_paper():
+    # a restarted run retries the old 403 failures first: nothing has worked yet in this run when 8 are refused
+    dois = ["10.1002/a-good-1"] + [f"10.1002/z-nolic-{n:02}" for n in range(10)]
+    for token, expected in (("good", {"done": 1, "failed": 10}), ("bad", {"failed": 11})):
+        HITS.clear()
+        con = make_db(f"wiley_restart_{token}", dois + ["10.1002/earlier-0"])
+        con.execute("UPDATE papers SET status='done', source='wiley', pdf_url=? WHERE doi='10.1002/earlier-0'",
+                    (f"{F.WILEY}/onlinelibrary/tdm/v1/articles/10.1002%2Fearlier-0",))   # from an earlier run
+        con.commit()
+        with env(WILEY_TDM_TOKEN=token):
+            run_fetcher(con, f"wiley_restart_{token}", sources="wiley", concurrency=1)
+        st = Counter(s for (s,) in con.execute("SELECT status FROM papers WHERE doi != '10.1002/earlier-0'"))
+        assert st == expected, (token, st)      # good token: access works, Wiley is not skipped
+        err = con.execute("SELECT error FROM papers WHERE doi='10.1002/a-good-1'").fetchone()[0] or ""
+        assert ("skipped" in err) == (token == "bad"), err   # bad token (e.g. VPN off): skipped as before
+
 def test_elsevier_notice_xml_is_kept_as_notice():
     out = TMP / "els_notice"
     con = make_db("els_notice", ["10.1016/ntc-1", "10.1016/ntc-2", "10.1016/els-3"])
@@ -426,6 +443,47 @@ def test_mark_incomplete_and_retry():
     assert con.execute("SELECT source FROM papers WHERE doi='10.9999/x-2'").fetchone()[0] == "unpaywall"
     assert con.execute("SELECT COUNT(*) FROM checks WHERE doi='10.1016/els-1'").fetchone()[0] == 0  # re-check
 
+
+
+def test_incomplete_from_the_same_api_is_not_asked_again():
+    HITS.clear()
+    con = make_db("tdm_again", ["10.1002/wil-1", "10.1002/wil-2"])
+    con.execute("UPDATE papers SET status='incomplete', source='wiley' WHERE doi='10.1002/wil-1'")      # Wiley sent the notice
+    con.execute("UPDATE papers SET status='incomplete', source='unpaywall' WHERE doi='10.1002/wil-2'")  # notice from OA
+    con.commit()
+    with env(WILEY_TDM_TOKEN="good"):
+        run_fetcher(con, "tdm_again", sources="wiley", retry_incomplete=True)
+    st = dict(con.execute("SELECT doi, status FROM papers"))
+    assert st == {"10.1002/wil-1": "incomplete", "10.1002/wil-2": "done"}, st
+    assert HITS[("localhost", "wiley")] == 1, HITS                          # wil-1 was not requested again
+
+
+def test_file_error_leaves_the_paper_and_the_run_goes_on():
+    real = F.Fetcher.process
+
+    async def flaky(self, client, doi, filename, old_status="pending"):
+        if doi in bad:   # like Nextcloud's virtual-files driver timing out (WinError 426)
+            raise OSError("The cloud operation was not completed before the time-out period expired")
+        return await real(self, client, doi, filename, old_status)
+
+    F.Fetcher.process = flaky
+    try:
+        bad = {"10.9999/good-2"}
+        con = make_db("fs_error", [f"10.9999/good-{n}" for n in range(1, 6)])
+        fetcher, _ = run_fetcher(con, "fs_error")
+        st = dict(con.execute("SELECT doi, status FROM papers"))
+        assert st["10.9999/good-2"] == "pending" and Counter(st.values()) == {"done": 4, "pending": 1}, st
+        assert fetcher.stats["file_error"] == 1 and not fetcher.stop_reason
+        # the folder is gone for good: the run stops after FS_ERRORS_STOP errors in a row, the rest is untouched
+        dois = [f"10.9999/good-{n}" for n in range(1, F.FS_ERRORS_STOP + 6)]
+        bad = set(dois)
+        con = make_db("fs_gone", dois)
+        fetcher, _ = run_fetcher(con, "fs_gone", concurrency=1)
+        assert "file errors in a row" in fetcher.stop_reason, fetcher.stop_reason
+        assert fetcher.stats["file_error"] == F.FS_ERRORS_STOP
+        assert Counter(s for (s,) in con.execute("SELECT status FROM papers")) == {"pending": len(dois)}
+    finally:
+        F.Fetcher.process = real
 
 def test_folder_guard_stops_on_missing_pdfs():
     """A sync folder that looks empty (e.g. Nextcloud virtual files without the client) must stop the commands."""
