@@ -1,13 +1,14 @@
 # Retracted-papers PDF download: analysis report
 
-*Status: 29 October 2026 (week 3). Phase A (open access) and a retry of temporary failures are complete, and every PDF has been checked. The Elsevier API key and the Wiley TDM token are in place and were tested on 29 October (section 8); the full Phase B run is next.*
+*Status: 31 October 2026 (week 3). Phase A (open access, with a retry of temporary failures) and Phase B (Elsevier and Wiley TDM APIs, 29–31 October) are complete, and every file has been checked. 25,580 of the 63,790 DOIs (40%) now have a full text (section 9).*
 
 ## 1. Summary
 
 - The Retraction Watch list has **63,790 unique DOIs** (72,790 rows; 5,950 rows have no usable DOI).
 - **Phase A downloaded 7,005 PDFs (11.0%, 17.1 GB)** from open-access sources in 3 h 24 min, with no crashes and no API errors. A retry one week later added 172 (7,177 in total).
 - **Quality check (week 2): 1,146 of these PDFs are only the retraction notice or the article's first page**, not the article. So **6,031 papers (9.5%) have a full-text PDF**; 57,759 are still missing (see section 5).
-- Of the 57,759 missing papers, **35,367 (61%) have no open-access copy at all**, **19,836 (34%) have an open-access link, but the publisher's site refused the download**, mostly through Cloudflare or similar bot protection, and 1,146 (2%) have only a notice / first page as PDF.
+- **Phase B (29–31 October) added 19,553 full texts** through the publishers' TDM APIs: 11,678 Hindawi and 2,734 Wiley PDFs, and 5,141 Elsevier full texts as XML. **25,580 papers (40%) now have a full text.** For 2,592 of the papers tried, the publisher itself only provides the retraction notice (section 9).
+- Before Phase B: of the 57,759 missing papers, **35,367 (61%) have no open-access copy at all**, **19,836 (34%) have an open-access link, but the publisher's site refused the download**, mostly through Cloudflare or similar bot protection, and 1,146 (2%) have only a notice / first page as PDF.
 - The biggest single group, **Hindawi (11,757 missing, 20% of all missing papers)**, is open access (CC-BY), but its download server is behind a Cloudflare bot check. Hindawi is now part of Wiley, and a test on 29 October confirmed that the Wiley TDM API delivers these papers as full PDFs.
 - Most of the remaining papers can only be obtained legally through the publishers' text-and-data-mining (TDM) APIs. The API keys are requested directly from the publishers first; the university library is asked only for what they don't cover. The per-publisher list of missing papers is in `reports/missing_by_publisher.csv`.
 
@@ -206,21 +207,21 @@ Things that were deliberately **not** done: no browser automation (e.g. Puppetee
 |---|---|---|---|
 | A | Unpaywall + OpenAlex (open access) | **done: 7,005 PDFs (11%)** | – |
 | A (retry) | same, `--retry-temporary` | **done: 172 more PDFs** (7,177 in total; 1,146 of them only a notice / first page) | – |
-| B | Wiley TDM (incl. Hindawi) | **tested: 14 of 20 Wiley + 2 of 2 Hindawi as full PDFs**; up to ~14,900 (Cochrane excluded) | Wiley TDM token (in place) |
-| B | Elsevier API | **tested: full text as XML (the PDF is only the first page)**; up to ~8,100 | Elsevier API key (in place), university network or full-tunnel VPN |
+| B | Wiley TDM (incl. Hindawi) | **done (29–31 Oct): 14,412 full PDFs** (11,678 Hindawi, 2,734 Wiley); 243 only the notice | Wiley TDM token, university network or full-tunnel VPN |
+| B | Elsevier API | **done (29 Oct): 5,141 full texts as XML** (the PDF would be only the first page); 2,349 only the notice | Elsevier API key, university network or full-tunnel VPN |
 | C | Crossref full-text links | depends on licences | library approval, university network |
 | – | IEEE, Springer Nature, T&F, SAGE, IOS Press … | – | publisher APIs where available, otherwise library |
 | end | Papers that still failed | – | manual download |
 
-With the Wiley and Elsevier keys, roughly half of the list looks reachable.
+After Phases A and B, 25,580 of the 63,790 DOIs (40%) have a full text.
 
-**Storage:** so far 17.1 GB for 7,177 PDFs (median 1.5 MB). The whole list would be about 150 GB. As much as possible stays in the cloud (about 100 GB available on cloud.ovgu.de); the rest goes on an external drive. Zipping the PDFs saves only about 13% (they are already compressed internally) and would make single files impossible to browse in the cloud, so the PDFs are uploaded as they are.
+**Storage:** 17.1 GB for the 7,177 PDFs of Phase A (median 1.5 MB); after Phase B 43.3 GB for 29,349 files (PDF and XML). The whole list would be about 150 GB. As much as possible stays in the cloud (about 100 GB available on cloud.ovgu.de); the rest goes on an external drive. Zipping the PDFs saves only about 13% (they are already compressed internally) and would make single files impossible to browse in the cloud, so the PDFs are uploaded as they are.
 
 **Open items:**
 
-1. **Phase B full run** (Wiley incl. Hindawi, Elsevier as XML), then check the results. At 1 Wiley request every 10 s this takes about 43 hours.
+1. **Phase B: done** (section 9). A few Wiley papers can be tried again later: 7 set aside after errors of the Nextcloud folder, and 9 where Wiley answered with a redirect the tool could not follow.
 2. **Library** (ub.it-anwendungen@ovgu.de, supervisor in cc): only after trying the publishers directly, for the publishers whose APIs are not available to us. Attach the list of missing papers by publisher.
-3. **Notice-only papers (1,146, of which 852 from Springer):** the retracted article itself often still exists. On Springer's article pages it is usually attached under "Electronic supplementary material" (example: `10.1007/s10854-016-4998-z`). Get the real article for each of these papers; if it is not available anywhere, mark the paper as "article not found" so it is clear the article itself is missing. The notice files are kept (`<ID> [notice] - <title>.pdf`). How these attachments can be fetched within the rules (official API, or manually) is still being clarified.
+3. **Notice-only papers (3,725 after Phase B: 2,349 Elsevier, 879 Springer Nature, 244 Wiley/Hindawi, 253 others):** the retracted article itself often still exists. On Springer's article pages it is usually attached under "Electronic supplementary material" (example: `10.1007/s10854-016-4998-z`). Get the real article for each of these papers; if it is not available anywhere, mark the paper as "article not found" so it is clear the article itself is missing. The notice files are kept (`<ID> [notice] - <title>.pdf`). How these attachments can be fetched within the rules (official API, or manually) is still being clarified.
 4. **Failed downloads:** keep track of every paper that failed (status `failed`, with the reason, in the database and in `index.csv`) and prepare a list so they can be downloaded manually at the end.
 5. Look up DOIs for the 5,950 entries without one (Crossref title search with strict matching).
 
@@ -247,3 +248,30 @@ So 32 of the 54 suspicious files (59%) were a different document: an open-access
 | Elsevier (10.1016), through the tool | 20 random missing papers | 15 complete articles (3,300–17,300 words, titles checked); 4 only the retraction notice (44–365 words), now kept as `[notice]` with status `incomplete`; 1 abstract only (not entitled) |
 
 Elsevier full texts are therefore saved as XML (structured full text, figures only referenced). For about one in five retracted Elsevier papers, Elsevier itself only provides the retraction notice, so these count as missing ("article not found" candidates). With these results, about 14,900 Wiley/Hindawi papers and 8,100 Elsevier papers are reachable through the official APIs, about 36% of the list.
+
+## 9. Phase B full run (29–31 October 2026)
+
+The full run started on 29 October at 13:40 with the two APIs as separate runs. Elsevier finished the same day (17:18). Wiley/Hindawi, limited to one request every 10 seconds, finished on 31 October at 14:53 after two restarts (see below). Every file was then checked with `verify`; files that are only the retraction notice were renamed `[notice]` (or `[short]` for XML with almost no text) and count as missing.
+
+| API | Papers to try | Full text | Only the notice | No licence (403 / abstract only) | Not found (404) | Other |
+|---|---:|---:|---:|---:|---:|---:|
+| Elsevier (10.1016), XML | 8,072 | 5,141 | 2,349 | 542 | 40 | 0 |
+| Wiley (10.1002, 10.1111), without Cochrane | 3,100 | 2,734 | 240 | 61 | 57 | 8 |
+| Hindawi (10.1155) via Wiley | 11,763 | 11,678 | 3 | 0 | 74 | 5 |
+| **Total** | **22,935** | **19,553** | **2,592** | **603** | **171** | **13** |
+
+(3 Hindawi papers were not reached; they are retried by the next run.)
+
+- **Hindawi:** 99% of the papers came as full PDFs. Hindawi was the largest group of missing papers, blocked by Cloudflare on its own download server.
+- **Elsevier:** 29% of the retracted Elsevier papers exist at Elsevier only as the retraction or removal notice (or a pre-proof cover page). 542 were refused: journals the university does not subscribe to.
+- **Wiley:** 243 PDFs were only the notice; Wiley delivers the notice instead of the article for these.
+
+Problems during the run (the request rate was never raised; each was fixed through a PR and covered by a test):
+
+| Problem | Fix |
+|---|---|
+| Elsevier was skipped after 41 papers: 8 articles in a row from journals without a licence (403) | PR #9: before skipping a TDM API, request a paper that worked before |
+| 161 Elsevier "full texts" were removal notices or almost empty (cover pages, corrections); the Wiley run was skipped because its successes were counted for the redirect host only | PR #10 |
+| A Nextcloud timeout (`WinError 426`) ended the Wiley run after 3,000 papers; the restart skipped Wiley at once (old refusals first, no working paper yet to check access with) and had asked Wiley again for 37 notices it had already sent | PR #11: a file error leaves one paper for later; access is checked with a paper from an earlier run; notices from an API are not requested again. In the last run, 3 more timeouts did no harm |
+
+After the run: 25,580 of 63,790 DOIs (40%) have a full text, 3,725 only the notice or first page, 7,652 failed (on the manual-download list; 794 of them were tried through the Elsevier or Wiley API without success, mostly no licence), and 26,833 have no open-access copy.
