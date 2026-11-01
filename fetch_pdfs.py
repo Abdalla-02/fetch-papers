@@ -834,14 +834,20 @@ def cmd_index(args):
 
 
 # ----------------------------------------------------------------------------- summary for the library
-# How the still-missing papers of the big publishers can be obtained legally.
+# How the still-missing papers of the big publishers can be obtained legally. The Elsevier and Wiley APIs
+# were used in Phase B (29-31 Oct 2026); what is still missing there was refused, not found or only a notice.
 ROUTES = {
-    "10.1155": "Wiley TDM API (token; Hindawi is part of Wiley) - open access, download site blocks bots",
-    "10.1002": "Wiley TDM API (token; not Cochrane reviews)", "10.1111": "Wiley TDM API (token)",
-    "10.1016": "Elsevier Article Retrieval API (API key, university network) - full text as XML",
+    "10.1155": "Wiley TDM API done (Oct 2026); the rest: not found at Wiley or only the notice - library",
+    "10.1002": "Wiley TDM API done (Oct 2026); the rest: no licence, not found, only the notice, Cochrane reviews - library",
+    "10.1111": "Wiley TDM API done (Oct 2026); the rest: no licence, not found or only the notice - library",
+    "10.1016": "Elsevier API done (Oct 2026, full text as XML); the rest: no licence or only the notice - library",
     "10.1109": "IEEE - no public TDM PDF API; library arrangement",
     "10.1007": "Springer Nature TDM - library", "10.1186": "Springer Nature TDM - library",
     "10.1038": "Springer Nature TDM - library",
+    "10.1080": "Taylor & Francis - asked about TDM (Oct 2026); otherwise library",
+    "10.2147": "Dove Medical Press (Taylor & Francis) - asked about TDM (Oct 2026); otherwise library",
+    "10.1088": "IOP Publishing - offered to deliver PDF/XML (Oct 2026), waits for our answer",
+    "10.1177": "SAGE - library", "10.3233": "IOS Press - library",
 }
 REASONS = ["closed access (no open-access copy)", "blocked by bot protection (Cloudflare)",
            "refused by site (HTTP 401/403/429)", "HTML page instead of PDF",
