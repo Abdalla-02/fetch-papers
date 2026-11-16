@@ -224,7 +224,7 @@ CREATE TABLE IF NOT EXISTS papers (
     record_ids TEXT,              -- Retraction Watch IDs sharing this DOI
     title      TEXT,
     filename   TEXT UNIQUE,
-    status     TEXT DEFAULT 'pending',   -- pending | done | not_found | failed | incomplete | article_not_found
+    status     TEXT DEFAULT 'pending',   -- pending | done | no_access | failed | incomplete | article_not_found
     source     TEXT,
     pdf_url    TEXT,
     error      TEXT,
@@ -242,6 +242,12 @@ def open_db(path: str) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
+    # until Nov 2026 'no_access' was called 'not_found' - too close to 'article_not_found'.
+    # Only write if needed: an open write transaction would lock the database for other commands.
+    if con.execute("SELECT 1 FROM papers WHERE status='not_found' LIMIT 1").fetchone():
+        with con:
+            n = con.execute("UPDATE papers SET status='no_access' WHERE status='not_found'").rowcount
+        print(f"database: renamed status 'not_found' to 'no_access' for {n} papers (same meaning)", file=sys.stderr)
     return con
 
 
@@ -644,10 +650,10 @@ class Fetcher:
                       (" | ".join(errors) or "no PDF link found in any source")[:2000])
             self.stats["still_incomplete"] += 1
         elif not tried and not lookup_errors:
-            self.save(doi, "not_found", None, None, "no PDF link found in any source")
-            self.stats["not_found"] += 1
+            self.save(doi, "no_access", None, None, "no PDF link found in any source")
+            self.stats["no_access"] += 1
         else:
-            # a failed index lookup means "unknown", not "not found" -> keep it retryable
+            # a failed index lookup means "unknown", not "no access" -> keep it retryable
             self.save(doi, "failed", None, None, " | ".join(errors)[:2000])
             self.stats["failed"] += 1
 
@@ -679,7 +685,7 @@ class Fetcher:
         rate = n_done / el if el else 0
         eta = (n_total - n_done) / rate / 3600 if rate else 0
         ok = sum(v for k, v in self.stats.items() if k.startswith("done_"))
-        print(f"[{n_done}/{n_total}] ok={ok} not_found={self.stats['not_found']} "
+        print(f"[{n_done}/{n_total}] ok={ok} no_access={self.stats['no_access']} "
               f"failed={self.stats['failed']}  {rate*60:.0f}/min  ETA {eta:.1f} h", flush=True)
 
     def can_handle(self, doi: str) -> bool:
@@ -701,7 +707,7 @@ class Fetcher:
     async def run(self):
         retry_failed = self.a.retry_failed or self.a.retry_temporary
         statuses = ["pending"] + (["failed"] if retry_failed else []) \
-                   + (["not_found"] if self.a.retry_not_found else []) \
+                   + (["no_access"] if self.a.retry_no_access else []) \
                    + (["incomplete"] if getattr(self.a, "retry_incomplete", False) else [])
         sql =f"SELECT doi, filename, status, error, source FROM papers WHERE status IN ({','.join('?'*len(statuses))})"
         params = list(statuses)
@@ -892,7 +898,7 @@ TEMPORARY_REASONS = {REASONS[4], REASONS[7], REASONS[8]}
 
 def classify(status: str, error: str | None) -> str:
     """One main reason per missing paper (most informative first)."""
-    if status == "not_found":
+    if status == "no_access":
         return REASONS[0]
     if status == "article_not_found":
         return REMOVED_REASON
@@ -1376,7 +1382,7 @@ def cmd_report(args):
         print("exported to", args.export)
 
 
-def main():
+def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db", default="papers.sqlite", help="state database (default: papers.sqlite)")
     p.add_argument("--env", help="file with API keys (default: .env in the current folder or next to the script)")
@@ -1401,7 +1407,9 @@ def main():
     r.add_argument("--retry-temporary", action="store_true",
                    help="retry only failures that may be temporary (timeouts, network errors, HTTP 5xx), "
                         "not papers on sites that blocked us")
-    r.add_argument("--retry-not-found", action="store_true")
+    r.add_argument("--retry-no-access", "--retry-not-found", dest="retry_no_access", action="store_true",
+                   help="try again for papers no source had a link for (status no_access; "
+                        "--retry-not-found is the old name)")
     r.add_argument("--retry-incomplete", action="store_true",
                    help="try again for papers whose PDF is only a notice / first page (see mark-incomplete)")
     r.add_argument("--wiley-prefixes", default=WILEY_PREFIXES,
@@ -1450,7 +1458,11 @@ def main():
     n.add_argument("--dry-run", action="store_true", help="only show what would change")
     n.set_defaults(func=cmd_rename)
 
-    args = p.parse_args()
+    return p
+
+
+def main():
+    args = make_parser().parse_args()
     load_env(args.env)   # API keys from .env - never hard-coded, never committed
     args.func(args)
 

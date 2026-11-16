@@ -45,7 +45,7 @@ Largest publishers (by DOI prefix):
 | Status | Count | Share |
 |---|---|---|
 | `done` (PDF saved) | 49 | 12% |
-| `not_found` (no open-access PDF in Unpaywall/OpenAlex) | 219 | 55% |
+| `no_access`, then called `not_found` (no open-access PDF in Unpaywall/OpenAlex) | 219 | 55% |
 | `failed` (PDF link exists, download refused) | 132 | 33% |
 
 **Quality check:** for the first 13 PDFs, the title and DOI were compared with the text of each PDF. All matched. One file is a full 542-page conference supplement that contains the paper's abstract; it is the correct document, but a whole issue.
@@ -171,7 +171,7 @@ The verdicts are stored in the database (table `checks`), shown in `index.csv` (
 
 | Change | Why |
 |---|---|
-| A failed index lookup is now `failed` (with the reason), not `not_found` | Before, papers hit by a temporary API error were silently treated as "no PDF exists" and not retried |
+| A failed index lookup is now `failed` (with the reason), not `not_found` (now `no_access`) | Before, papers hit by a temporary API error were silently treated as "no PDF exists" and not retried |
 | Wiley TDM rate limit: 1/s → 1 per 10 s | Wiley allows at most 60 requests per 10 minutes; the old setting broke that rule |
 | Crossref rate limit: 5/s → 3/s | Crossref allows at most 3 requests at the same time |
 | Redirects are followed one hop at a time through the rate limiter | Links via doi.org or repositories redirected to publisher hosts without that host's rate limit |

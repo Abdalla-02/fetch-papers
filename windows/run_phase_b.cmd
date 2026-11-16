@@ -27,7 +27,7 @@ set PYTHONIOENCODING=utf-8
 cd /d "%DATA%"
 if not exist logs mkdir logs
 set PY="%REPO%\venv\Scripts\python.exe" -u "%REPO%\windows\keep_awake_run.py" "%REPO%\fetch_pdfs.py" --db papers.sqlite
-set FLAGS=--sources %SOURCES% --retry-not-found --retry-failed --retry-incomplete --wiley-prefixes %WILEY_PREFIXES% --progress-every 100
+set FLAGS=--sources %SOURCES% --retry-no-access --retry-failed --retry-incomplete --wiley-prefixes %WILEY_PREFIXES% --progress-every 100
 echo ===== Phase B started %date% %time% (TEST=%TEST%, sources %SOURCES%) ===== >> %LOG%
 if "%TEST%"=="1" (
     %PY% run --email %EMAIL% --out "%OUT%" %FLAGS% --prefix 10.1016 --limit 20 >> %LOG% 2>&1

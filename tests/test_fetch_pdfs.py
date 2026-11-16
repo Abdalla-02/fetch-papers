@@ -130,7 +130,7 @@ def make_db(name, dois):
 
 def run_fetcher(con, name, concurrency=4, **overrides):
     opts = dict(out=str(TMP / name), sources="unpaywall", email="test@example.org", verbose=False,
-                retry_failed=False, retry_temporary=False, retry_not_found=False, retry_incomplete=False,
+                retry_failed=False, retry_temporary=False, retry_no_access=False, retry_incomplete=False,
                 wiley_prefixes=F.WILEY_PREFIXES, prefix=None, limit=None, concurrency=concurrency,
                 progress_every=1000)
     opts.update(overrides)
@@ -153,11 +153,25 @@ def test_naming():
 
 
 def test_classify():
-    assert F.classify("not_found", None) == F.REASONS[0]
+    assert F.classify("no_access", None) == F.REASONS[0]
     assert F.classify("failed", "unpaywall: HTTP 403 (Cloudflare bot challenge) <u>") == F.REASONS[1]
     assert F.classify("failed", "unpaywall: ConnectTimeout:  <u>") in F.TEMPORARY_REASONS
     assert F.classify("failed", "unpaywall: HTTP 503 <u>") in F.TEMPORARY_REASONS
     assert F.classify("failed", "unpaywall: HTTP 404 <u>") not in F.TEMPORARY_REASONS
+
+
+def test_old_status_not_found_becomes_no_access():
+    """A database from before Nov 2026 says 'not_found': opening it renames that to 'no_access'; the old flag works."""
+    con = make_db("old_status", ["10.9999/good-1", "10.9999/good-2"])
+    con.execute("UPDATE papers SET status='not_found'")
+    con.commit()
+    con.close()
+    con = F.open_db(str(TMP / "old_status.sqlite"))
+    assert dict(con.execute("SELECT status, COUNT(*) FROM papers GROUP BY 1")) == {"no_access": 2}
+    for flag in ("--retry-no-access", "--retry-not-found"):                # the old name still works
+        assert F.make_parser().parse_args(["run", "--email", "x", "--out", "y", flag]).retry_no_access
+    run_fetcher(con, "old_status", retry_no_access=True)            # selected again and downloaded
+    assert dict(con.execute("SELECT status, COUNT(*) FROM papers GROUP BY 1")) == {"done": 2}
 
 
 def test_blocked_host_subfolders_and_no_key_leak():
@@ -489,7 +503,7 @@ def test_mark_removed():
     assert dict(con.execute("SELECT doi, status FROM papers")) == st
     # 'run' never selects them again, whatever retry flag is set
     with env(ELSEVIER_API_KEY="good"):
-        run_fetcher(con, "removed", sources="elsevier", retry_incomplete=True, retry_failed=True, retry_not_found=True)
+        run_fetcher(con, "removed", sources="elsevier", retry_incomplete=True, retry_failed=True, retry_no_access=True)
     assert con.execute("SELECT status FROM papers WHERE doi='10.1016/wd-1'").fetchone()[0] == "article_not_found"
     # 'rename' moves the [removed] file with its paper
     con.execute("UPDATE papers SET title='New title 1' WHERE doi='10.1016/wd-1'")
