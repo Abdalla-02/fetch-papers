@@ -23,6 +23,7 @@ Usage:
   python fetch_pdfs.py summary --out-dir reports --email you@uni.de   (lists for the library)
   python fetch_pdfs.py mark-incomplete --out /data/retracted_pdfs [--dry-run]
   python fetch_pdfs.py run     ... --sources elsevier,wiley --retry-incomplete   (Phase B, keys in .env)
+  python fetch_pdfs.py mark-removed --out /data/retracted_pdfs [--dry-run]   (Elsevier: text removed -> article not found)
   python fetch_pdfs.py index   --out /data/retracted_pdfs        (writes index.csv)
   python fetch_pdfs.py rename  --out /data/retracted_pdfs [--dry-run]
 
@@ -200,6 +201,17 @@ def xml_verdict(data: bytes) -> tuple[str, int]:
     return "ok", words
 
 
+# Elsevier replaces a withdrawn or removed article by a notice whose title starts with "WITHDRAWN:" / "REMOVED:"
+# (sometimes "Withdrawn: ..."); the article text itself is gone. A retracted article ("RETRACTED: ...") is kept.
+REMOVED_TITLE = re.compile(r"\s*(WITHDRAWN|REMOVED)\b", re.I)
+
+
+def xml_title(data: bytes) -> str:
+    """Title (dc:title) of an Elsevier full-text XML, '' if there is none."""
+    m = re.search(r"<dc:title[^>]*>(.*?)</dc:title>", data.decode("utf-8", "replace"), re.S)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1))).strip() if m else ""
+
+
 def file_ext(source: str | None) -> str:
     """Extension of a downloaded full text: '.xml' for XML_SOURCES, otherwise '.pdf'."""
     return ".xml" if source in XML_SOURCES else ".pdf"
@@ -212,7 +224,7 @@ CREATE TABLE IF NOT EXISTS papers (
     record_ids TEXT,              -- Retraction Watch IDs sharing this DOI
     title      TEXT,
     filename   TEXT UNIQUE,
-    status     TEXT DEFAULT 'pending',   -- pending | done | not_found | failed | incomplete
+    status     TEXT DEFAULT 'pending',   -- pending | done | not_found | failed | incomplete | article_not_found
     source     TEXT,
     pdf_url    TEXT,
     error      TEXT,
@@ -806,10 +818,10 @@ def write_index(con, out: Path):
     for doi, ids, title, fn, status, check, source, url, err in con.execute(
             "SELECT p.doi, record_ids, title, filename, status, c.verdict, source, pdf_url, error "
             "FROM papers p LEFT JOIN checks c ON c.doi = p.doi"):
-        if status == "incomplete":  # the file on disk is the marked notice / first page
+        if status in MARKED_STATUSES:  # the file on disk is the marked notice / first page
             fn = marked_name(fn, check)
         folder, _, name = fn.rpartition("/")
-        done = status in ("done", "incomplete")
+        done = status == "done" or status in MARKED_STATUSES
         rows.append([first_id(ids), ids, doi, doi.split("/")[0], title, folder if done else "",
                      f"{name}{file_ext(source)}" if done else "", status, (check or "") if done else "",
                      source, url, (err or "")[:300]])
@@ -853,11 +865,16 @@ REASONS = ["closed access (no open-access copy)", "blocked by bot protection (Cl
            "refused by site (HTTP 401/403/429)", "HTML page instead of PDF",
            "network error / timeout (worth retrying)", "TLS certificate error on site",
            "broken link (HTTP 404/410)", "index lookup error (worth retrying)", "other",
-           "PDF is only a retraction notice or first page"]
+           "article not found (removed by the publisher, only the notice exists)",
+           "PDF is only a retraction notice or first page"]   # keep this one last: REASONS[-1]
+REMOVED_REASON = REASONS[9]
 # 'verify' verdicts meaning the downloaded PDF is not the full article
 INCOMPLETE_VERDICTS = ("notice", "short", "short_text")
-# 'mark-incomplete' keeps such a file under a marked name, e.g. '001454 [notice] - Title.pdf'
-MARK_LABELS = {"notice": "notice", "short": "first page", "short_text": "short"}
+# 'mark-incomplete' keeps such a file under a marked name, e.g. '001454 [notice] - Title.pdf';
+# 'mark-removed' renames the notice of an article the publisher removed to '001454 [removed] - Title.xml'
+MARK_LABELS = {"notice": "notice", "short": "first page", "short_text": "short", "removed": "removed"}
+# statuses whose file on disk has a marked name (see marked_name)
+MARKED_STATUSES = ("incomplete", "article_not_found")
 
 
 def marked_name(filename: str, verdict: str | None) -> str:
@@ -877,6 +894,8 @@ def classify(status: str, error: str | None) -> str:
     """One main reason per missing paper (most informative first)."""
     if status == "not_found":
         return REASONS[0]
+    if status == "article_not_found":
+        return REMOVED_REASON
     e = error or ""
     if "Cloudflare" in e:
         return REASONS[1]
@@ -1054,10 +1073,10 @@ def check_pdf_folder(con, out: Path, args):
     it cannot see, and 'verify' / 'mark-incomplete' would report nonsense. --skip-folder-check overrides."""
     if getattr(args, "skip_folder_check", False):
         return
-    expected = [(marked_name(fn, v) if status == "incomplete" else fn) + file_ext(src)
+    expected = [(marked_name(fn, v) if status in MARKED_STATUSES else fn) + file_ext(src)
                 for fn, status, v, src in con.execute(
                     "SELECT filename, status, c.verdict, p.source FROM papers p LEFT JOIN checks c ON c.doi = p.doi "
-                    "WHERE p.status IN ('done', 'incomplete')")]
+                    f"WHERE p.status IN ('done', {','.join('?' * len(MARKED_STATUSES))})", MARKED_STATUSES)]
     if len(expected) < FOLDER_CHECK_MIN:
         return
     present = sum(1 for fn in expected if (out / fn).exists())
@@ -1172,8 +1191,8 @@ def cmd_mark_incomplete(args):
     out = Path(args.out)
     check_pdf_folder(con, out, args)
     rows = con.execute("SELECT p.doi, p.filename, c.verdict, p.source FROM papers p JOIN checks c ON c.doi = p.doi "
-                       f"WHERE p.status='done' AND c.verdict IN ({','.join('?' * len(MARK_LABELS))})",
-                       list(MARK_LABELS)).fetchall()
+                       f"WHERE p.status='done' AND c.verdict IN ({','.join('?' * len(INCOMPLETE_VERDICTS))})",
+                       INCOMPLETE_VERDICTS).fetchall()
     plan = [(doi, out / f"{fn}{file_ext(src)}", out / f"{marked_name(fn, v)}{file_ext(src)}", v)
             for doi, fn, v, src in rows]
     missing = [p for p in plan if not p[1].exists()]
@@ -1207,6 +1226,60 @@ def cmd_mark_incomplete(args):
                         [(time.time(), doi) for doi, *_ in plan])
     print(f"marked {len(done)} files; their papers now have status 'incomplete' "
           f"(fetch the real article later with: run ... --retry-incomplete)")
+    write_index(con, out)
+
+
+def cmd_mark_removed(args):
+    """Papers whose Elsevier XML is only the notice of a WITHDRAWN / REMOVED article (title starts with that word):
+    the publisher has removed the article text, so the paper becomes 'article_not_found' and its notice is kept
+    as '<RW ID> [removed] - <title>.xml'. Retracted articles ("RETRACTED: ...") are not touched. Never deletes."""
+    con = open_db(args.db)
+    out = Path(args.out)
+    check_pdf_folder(con, out, args)
+    rows = con.execute("SELECT p.doi, p.filename, c.verdict, p.source, c.pages FROM papers p "
+                       "LEFT JOIN checks c ON c.doi = p.doi "
+                       f"WHERE p.status='incomplete' AND p.source IN ({','.join('?' * len(XML_SOURCES))})",
+                       XML_SOURCES).fetchall()
+    plan, missing, clash = [], [], []
+    for doi, fn, v, src, pages in rows:
+        path = out / f"{marked_name(fn, v)}{file_ext(src)}"
+        if not path.exists():
+            missing.append(path)
+            continue
+        title = xml_title(path.read_bytes())
+        if REMOVED_TITLE.match(title):
+            dst = out / f"{marked_name(fn, 'removed')}{file_ext(src)}"
+            (clash if dst.exists() else plan).append((doi, path, dst, title, pages))
+    words = defaultdict(int)
+    for p in plan:
+        words[REMOVED_TITLE.match(p[3]).group(1).upper()] += 1
+    print(f"{len(rows)} incomplete papers with a notice XML; {len(plan)} of them were removed by the publisher ("
+          + ", ".join(f"{n} {w}" for w, n in sorted(words.items())) + ") -> status 'article_not_found', tag [removed]")
+    for _, src, dst, title, _ in plan[:5]:
+        print(f"  {src.parent.name}/{src.name[:70]}\n   -> {dst.parent.name}/{dst.name[:70]}\n      title: {title[:70]}")
+    if missing or clash:
+        print(f"skipped: {len(missing)} notice files not found on disk, {len(clash)} [removed] file already exists "
+              f"(e.g. {(missing or [c[1] for c in clash])[0].name})")
+    if args.dry_run:
+        print("dry run - nothing changed")
+        return
+    done = []
+    try:
+        for _, src, dst, _, _ in plan:
+            os.rename(src, dst)
+            done.append((src, dst))
+    except OSError as e:  # undo, so files and database stay consistent
+        for src, dst in reversed(done):
+            os.rename(dst, src)
+        sys.exit(f"rename failed ({e}) - undone, nothing changed")
+    now = time.time()
+    with con:
+        con.executemany("UPDATE papers SET status='article_not_found', updated=? WHERE doi=?",
+                        [(now, doi) for doi, *_ in plan])
+        con.executemany("INSERT OR REPLACE INTO checks VALUES (?,?,?,?,?)",
+                        [(doi, "removed", f"removed by the publisher, notice title: {title[:200]}", pages or 0, now)
+                         for doi, _, _, title, pages in plan])
+    print(f"marked {len(done)} papers as 'article_not_found' (files renamed to '... [removed] - ...')")
     write_index(con, out)
 
 
@@ -1365,6 +1438,12 @@ def main():
     k.add_argument("--out", required=True, help="the PDF folder")
     k.add_argument("--dry-run", action="store_true", help="only show what would change")
     k.set_defaults(func=cmd_mark_incomplete)
+
+    d = sub.add_parser("mark-removed", help="Elsevier notices of WITHDRAWN / REMOVED articles: status 'article_not_found', "
+                                            "file '<ID> [removed] - <title>.xml' (never deletes)")
+    d.add_argument("--out", required=True, help="the PDF folder")
+    d.add_argument("--dry-run", action="store_true", help="only show what would change")
+    d.set_defaults(func=cmd_mark_removed)
 
     n = sub.add_parser("rename", help="rename/move existing PDFs to the current naming scheme (never deletes)")
     n.add_argument("--out", required=True, help="the PDF folder")
