@@ -445,6 +445,60 @@ def test_mark_incomplete_and_retry():
 
 
 
+def test_mark_removed():
+    """Elsevier notices of WITHDRAWN / REMOVED articles -> 'article_not_found', file '[removed]'; RETRACTED is kept."""
+    out = TMP / "removed"
+    con = make_db("removed", ["10.1016/wd-1", "10.1016/rm-2", "10.1016/rt-3", "10.1016/els-4", "10.9999/x-5"])
+    cases = {"10.1016/wd-1": ("notice", "WITHDRAWN: Title 1"), "10.1016/rm-2": ("short_text", "Removed: Title 2"),
+             "10.1016/rt-3": ("notice", "RETRACTED: Title 3")}
+    for doi, fn in con.execute("SELECT doi, filename FROM papers").fetchall():
+        (out / fn).parent.mkdir(parents=True, exist_ok=True)
+        if doi in cases:
+            v, title = cases[doi]
+            body = ELS_NOTICE.replace(b"<coredata>", f"<coredata><dc:title>\n  {title}</dc:title>".encode())
+            (out / f"{F.marked_name(fn, v)}.xml").write_bytes(body)
+            con.execute("UPDATE papers SET status='incomplete', source='elsevier', error='elsevier: notice' WHERE doi=?",
+                        (doi,))
+            con.execute("INSERT INTO checks VALUES (?,?,?,?,?)", (doi, v, "elsevier: notice", 0, 0))
+        elif doi == "10.1016/els-4":
+            (out / f"{fn}.xml").write_bytes(ELS_FULL_TEXT)
+            con.execute("UPDATE papers SET status='done', source='elsevier' WHERE doi=?", (doi,))
+    con.commit()
+    assert F.xml_title(ELS_FULL_TEXT) == "" and F.REASONS[-1].startswith("PDF is only")   # other scripts use [-1]
+    args = types.SimpleNamespace(db=str(TMP / "removed.sqlite"), out=str(out), dry_run=True, skip_folder_check=False)
+    F.cmd_mark_removed(args)                                               # dry run: nothing changes
+    assert Counter(s for (s,) in con.execute("SELECT status FROM papers")) == {"incomplete": 3, "done": 1, "pending": 1}
+    args.dry_run = False
+    F.cmd_mark_removed(args)
+    st = dict(con.execute("SELECT doi, status FROM papers"))
+    assert st == {"10.1016/wd-1": "article_not_found", "10.1016/rm-2": "article_not_found", "10.1016/rt-3": "incomplete",
+                  "10.1016/els-4": "done", "10.9999/x-5": "pending"}, st
+    fns = dict(con.execute("SELECT doi, filename FROM papers"))
+    for doi in ("10.1016/wd-1", "10.1016/rm-2"):
+        assert (out / f"{F.marked_name(fns[doi], 'removed')}.xml").exists()
+        assert not (out / f"{F.marked_name(fns[doi], cases[doi][0])}.xml").exists()
+    assert F.marked_name(fns["10.1016/wd-1"], "removed").endswith("000001 [removed] - Title 1")
+    assert (out / f"{F.marked_name(fns['10.1016/rt-3'], 'notice')}.xml").exists()          # retracted: untouched
+    assert dict(con.execute("SELECT doi, verdict FROM checks"))["10.1016/wd-1"] == "removed"
+    assert con.execute("SELECT error FROM papers WHERE doi='10.1016/wd-1'").fetchone()[0] == "elsevier: notice"
+    index = (out / "index.csv").read_text(encoding="utf-8-sig")
+    assert "000001 [removed] - Title 1.xml" in index and "000003 [notice] - Title 3.xml" in index
+    assert F.classify("article_not_found", "elsevier: notice") == F.REMOVED_REASON
+    F.check_pdf_folder(con, out, args)                                     # [removed] files count as present
+    F.cmd_mark_removed(args)                                               # a second run changes nothing
+    assert dict(con.execute("SELECT doi, status FROM papers")) == st
+    # 'run' never selects them again, whatever retry flag is set
+    with env(ELSEVIER_API_KEY="good"):
+        run_fetcher(con, "removed", sources="elsevier", retry_incomplete=True, retry_failed=True, retry_not_found=True)
+    assert con.execute("SELECT status FROM papers WHERE doi='10.1016/wd-1'").fetchone()[0] == "article_not_found"
+    # 'rename' moves the [removed] file with its paper
+    con.execute("UPDATE papers SET title='New title 1' WHERE doi='10.1016/wd-1'")
+    con.commit()
+    F.cmd_rename(args)
+    new = con.execute("SELECT filename FROM papers WHERE doi='10.1016/wd-1'").fetchone()[0]
+    assert new.endswith("000001 - New title 1") and (out / f"{F.marked_name(new, 'removed')}.xml").exists()
+
+
 def test_incomplete_from_the_same_api_is_not_asked_again():
     HITS.clear()
     con = make_db("tdm_again", ["10.1002/wil-1", "10.1002/wil-2"])
