@@ -92,7 +92,7 @@ The note column also flags PDFs with more than 60 pages (probably a whole issue 
 3. **Small test first** (20 papers per publisher), then look at the log and the new PDFs:
    ```bash
    python fetch_pdfs.py run --email you@uni.de --out /data/retracted_pdfs --sources elsevier,wiley \
-       --retry-not-found --retry-failed --retry-incomplete --prefix 10.1016 --limit 20
+       --retry-no-access --retry-failed --retry-incomplete --prefix 10.1016 --limit 20
    # the same again with --prefix 10.1002, then:
    python fetch_pdfs.py verify --out /data/retracted_pdfs
    ```
@@ -117,7 +117,7 @@ Good to know:
 
 ```bash
 python fetch_pdfs.py run --email you@uni.de --out /data/retracted_pdfs \
-    --sources crossref --retry-not-found --retry-failed
+    --sources crossref --retry-no-access --retry-failed
 ```
 
 **Watching progress:**
@@ -208,10 +208,10 @@ rclone copy /data/retracted_pdfs cloud:RetractedPapers --progress   # repeat aft
 - **Long pauses requested by a server:** a 429/5xx answer with `Retry-After` up to `MAX_RETRY_AFTER` (120 s) is respected by pausing that host. If a publisher or repository site asks for a longer pause (for example "503, Retry-After: 3600"), it is skipped for the rest of the run instead, so its papers don't hold up the whole run; they stay `failed` and can be retried later. If one of the APIs themselves (Unpaywall, OpenAlex, Crossref, Elsevier, Wiley) asks for a longer pause, which usually means a quota is used up, the run **stops cleanly** with a `STOPPED EARLY` message and exit code 3; the papers not reached yet keep their status, so running the same command later simply continues.
 - **Statuses:**
   - `done`: the PDF was saved
-  - `not_found`: no source had a PDF link
+  - `no_access`: no source had a PDF link, i.e. no open-access copy and no TDM API that delivers it (called `not_found` until Nov 2026; an older database is renamed automatically when it is opened, and `--retry-not-found` still works)
   - `failed`: a link existed but the download failed, or an index lookup failed (the reason is in the `error` column)
   - `incomplete`: the only PDF we have is a retraction notice or the first page (kept as `<ID> [notice] - <title>.pdf` / `<ID> [first page] - <title>.pdf`, see `mark-incomplete`)
-  - `article_not_found`: the publisher has removed the article itself; we only have its notice (kept as `<ID> [removed] - <title>.xml`, see `mark-removed`). Different from `not_found`, which only means that no open-access copy was found
+  - `article_not_found`: the publisher has removed the article itself; we only have its notice (kept as `<ID> [removed] - <title>.xml`, see `mark-removed`). Different from `no_access`, which only means that we found no copy we may download
 
 ## 6. Tests
 
